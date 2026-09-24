@@ -26,13 +26,13 @@ func TestSpecFetch_Timeout(t *testing.T) {
 			responseDelay: 5 * time.Millisecond,
 			timeout:       100 * time.Millisecond,
 			wantTimeout:   false,
-	},
+		},
 		{
 			name:          "times out on slow spec fetch endpoint",
 			responseDelay: 100 * time.Millisecond,
 			timeout:       10 * time.Millisecond,
 			wantTimeout:   true,
-	},
+		},
 	}
 
 	for _, tt := range tests {
