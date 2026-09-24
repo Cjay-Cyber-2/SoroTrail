@@ -1,7 +1,6 @@
 package telemetry
 
 import (
-	"context"
 	"log/slog"
 	"net/url"
 	"strings"
