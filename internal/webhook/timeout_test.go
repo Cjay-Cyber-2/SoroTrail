@@ -26,13 +26,13 @@ func TestWebhookDelivery_Timeout(t *testing.T) {
 			serverDelay: 10 * time.Millisecond,
 			timeout:     200 * time.Millisecond,
 			wantTimeout: false,
-	},
+		},
 		{
 			name:        "times out when server is slower than deadline",
 			serverDelay: 200 * time.Millisecond,
 			timeout:     20 * time.Millisecond,
 			wantTimeout: true,
-	},
+		},
 	}
 
 	for _, tt := range tests {
