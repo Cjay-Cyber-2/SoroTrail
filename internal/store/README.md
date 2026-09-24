@@ -1,16 +1,20 @@
-# Store query timeouts
+# store
 
-Store queries are executed through `GuardedStore`, which applies the configured
-per-query timeout to each store operation. The timeout is exposed through the
-existing `API_QUERY_TIMEOUT` configuration setting and defaults to 25 seconds.
+## Purpose
+The `internal/store` package provides durable persistence for contract events, ingestion state, watched contracts, replay tracking, and audit tables across PostgreSQL and SQLite. It implements the primary repository pattern for SoroTrail, ensuring clean storage isolation with zero ORM usage (plain SQL via `pgx` and `database/sql`).
 
-The guarded store derives a child context for each operation and passes that
-context to the underlying store implementation. Consequently, the earlier of
-the request's existing deadline and `API_QUERY_TIMEOUT` determines how long the
-query may run. Cancellation is propagated to the database driver, which stops
-the in-flight query and returns the context error.
+## Entry Points
+- `Store`: The primary interface defining all storage operations.
+- `NewPostgres(pool *pgxpool.Pool) *Postgres`: Constructs a PostgreSQL store instance.
+- `NewSQLite(db *sql.DB) *SQLite`: Constructs a SQLite store instance.
+- `Migrate(ctx context.Context, dbConn any) error`: Executes pending database migrations.
 
-`API_SLOW_QUERY_THRESHOLD` controls slow-query logging independently; it does
-not extend the query timeout. The timeout applies to reads and other guarded
-store operations without changing any endpoint, configuration, or database
-schema contracts.
+## Invariants & Design Decisions
+1. **Idempotent Upserts**: Inserting the same TOID event twice is a strict no-op (`DO NOTHING` on primary key conflict) that does not corrupt topics, values, or raw XDR fields.
+2. **Multi-Network Isolation**: Every event and ingestion state is partitioned by network (e.g. `default`, `testnet`, `mainnet`), preventing cross-network data pollution.
+3. **Fail-Closed Authorization Scope**: Queries require an explicit `Scope` object. A zero scope defaults to returning nothing rather than bypassing checks.
+4. **Ascending Cursor Pagination**: Event pagination requires deterministic sorting (`id`, `ledger`, `created_at`) returning rows in strict ascending or descending order without gaps or skipped rows during concurrent insertions.
+
+## Architecture Cross-Links
+- See [`../../docs/architecture.md`](../../docs/architecture.md) for data flow diagrams and the complete persistence layout.
+- See [`../../docs/archival.md`](../../docs/archival.md) for archival and pruning strategies.
