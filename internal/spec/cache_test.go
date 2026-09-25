@@ -1,6 +1,7 @@
 package spec
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"testing"
@@ -8,13 +9,9 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-type Spec struct {
-	ContractID string
-}
-
 func TestSpecCache_ConcurrentRace(t *testing.T) {
 	t.Parallel()
-	cache := NewCache()
+	cache := NewCache(nil)
 	var wg sync.WaitGroup
 	goroutines := 20
 	ops := 100
@@ -24,11 +21,13 @@ func TestSpecCache_ConcurrentRace(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			contractID := fmt.Sprintf("contract-%d", id%5)
+			wasmHash := fmt.Sprintf("hash-%d", id%5)
+			ctx := context.Background()
 			for j := 0; j < ops; j++ {
 				if j%2 == 0 {
-					cache.Set(contractID, &Spec{ContractID: contractID})
+					_ = cache.Set(ctx, &ContractSpec{WasmHash: wasmHash, ContractID: contractID})
 				} else {
-					_, _ = cache.Get(contractID)
+					_ = cache.Get(wasmHash)
 				}
 			}
 		}(i)
