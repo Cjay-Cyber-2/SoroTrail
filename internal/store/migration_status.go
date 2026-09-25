@@ -2,12 +2,9 @@ package store
 
 import (
 	"errors"
-	"fmt"
 	"os"
 
-	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/source"
-	"github.com/golang-migrate/migrate/v4/source/iofs"
 )
 
 // MigrationStatus describes the state of the database migration set.
@@ -17,40 +14,19 @@ type MigrationStatus struct {
 	Pending []uint
 }
 
-// GetMigrationStatus reports the database's current migration version and
+// GetMigrationStatus reports the database's current migration version and the
 // migrations that have not yet been applied. It does not modify the database.
+//
+// It is the historical entry point for this information and now delegates to
+// MigrateStatus, which works for both the Postgres and SQLite series (the
+// previous implementation only handled a URL registered with the default
+// golang-migrate database drivers).
 func GetMigrationStatus(databaseURL string) (MigrationStatus, error) {
-	migrationSource, err := iofs.New(postgresMigrationsFS, "migrations")
-	if err != nil {
-		return MigrationStatus{}, fmt.Errorf("opening migrations: %w", err)
-	}
-
-	m, err := migrate.NewWithSourceInstance("iofs", migrationSource, databaseURL)
-	if err != nil {
-		_ = migrationSource.Close()
-		return MigrationStatus{}, fmt.Errorf("creating migration client: %w", err)
-	}
-	defer func() {
-		_, _ = m.Close()
-	}()
-
-	version, dirty, err := m.Version()
-	if err != nil && !errors.Is(err, migrate.ErrNilVersion) {
-		return MigrationStatus{}, fmt.Errorf("reading migration version: %w", err)
-	}
-	if errors.Is(err, migrate.ErrNilVersion) {
-		version = 0
-		dirty = false
-	}
-
-	pending, err := migrationVersions(migrationSource, version)
-	if err != nil {
-		return MigrationStatus{}, fmt.Errorf("reading available migrations: %w", err)
-	}
-
-	return MigrationStatus{Version: version, Dirty: dirty, Pending: pending}, nil
+	return MigrateStatus(databaseURL)
 }
 
+// migrationVersions walks the source driver and returns every version greater
+// than current.
 func migrationVersions(migrationSource source.Driver, current uint) ([]uint, error) {
 	first, err := migrationSource.First()
 	if err != nil {

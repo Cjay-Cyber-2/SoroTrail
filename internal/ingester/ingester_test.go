@@ -18,6 +18,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
+	"github.com/sorotrail/sorotrail/internal/decode"
 	"github.com/sorotrail/sorotrail/internal/metrics"
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
@@ -501,6 +502,122 @@ func TestPagination_LegacyPagingTokenFallback(t *testing.T) {
 	assert.False(t, caughtUp)
 	state, _ := st.GetIngestionState(context.Background())
 	assert.Equal(t, "pt-2", state.LastCursor)
+}
+
+// TestPagination_EmptyPageDoesNotAdvanceCursor is the end-to-end regression
+// test for "handle empty getEvents pages correctly": a page that carries no
+// events must not advance the persisted cursor, even when the RPC attaches a
+// cursor to the empty response. Resuming from such a cursor would wedge the
+// ingester on a page the RPC has already exhausted.
+func TestPagination_EmptyPageDoesNotAdvanceCursor(t *testing.T) {
+	client := &mockRPC{
+		health: rpc.Health{Status: "healthy", LatestLedger: 500, OldestLedger: 10},
+		eventsResps: []rpc.GetEventsResponse{
+			// Cycle 1: empty page that DOES carry a cursor. That cursor must
+			// be ignored rather than persisted as progress.
+			{Events: nil, LatestLedger: 500, Cursor: "exhausted-cursor"},
+			// Cycle 2 resumes by ledger and finds a real event.
+			{Events: []rpc.Event{rpcEvent("e1", 501)}, LatestLedger: 502},
+		},
+	}
+	st := newMockStore()
+	ing := newTestIngester(client, st, Options{StartLedger: 100, PageLimit: 100})
+
+	caughtUp, err := ing.runOnce(context.Background())
+	require.NoError(t, err)
+	assert.True(t, caughtUp, "empty page means there is nothing new to ingest")
+
+	state, err := st.GetIngestionState(context.Background())
+	require.NoError(t, err)
+	assert.Empty(t, state.LastCursor, "empty page must not advance the cursor")
+	assert.Equal(t, int64(499), state.LastIngestedLedger,
+		"empty page advances the frontier to latestLedger-1")
+
+	// The next cycle must resume from the ledger (500), not replay the
+	// cursor the empty response carried.
+	_, err = ing.runOnce(context.Background())
+	require.NoError(t, err)
+	require.Len(t, client.eventsRequests, 2)
+	second := client.eventsRequests[1]
+	assert.Equal(t, uint32(500), second.StartLedger,
+		"resume from LastIngestedLedger+1")
+	assert.Empty(t, paginationCursor(second),
+		"the empty page's cursor must not be reused")
+	assert.Contains(t, st.events, "e1")
+}
+
+// TestNextState_CursorOnlyAdvancesOnProgress is the table-driven unit test for
+// the cursor-advance discipline: the cursor is persisted only when the page
+// carried events, and always reflects either the response cursor or the last
+// event's CursorValue fallback.
+func TestNextState_CursorOnlyAdvancesOnProgress(t *testing.T) {
+	tests := []struct {
+		name           string
+		resp           rpc.GetEventsResponse
+		pageLimit      uint
+		wantCursor     string
+		wantLedger     int64
+		wantCaughtUp   bool
+		wantPollNotNil bool
+	}{
+		{
+			name: "non-empty page keeps the response cursor",
+			resp: rpc.GetEventsResponse{
+				Events:       []rpc.Event{rpcEvent("e1", 100), rpcEvent("e2", 101)},
+				LatestLedger: 500,
+				Cursor:       "c2",
+			},
+			pageLimit:      2,
+			wantCursor:     "c2",
+			wantLedger:     101,
+			wantCaughtUp:   false,
+			wantPollNotNil: true,
+		},
+		{
+			name: "non-empty page falls back to the last event cursor",
+			resp: rpc.GetEventsResponse{
+				Events:       []rpc.Event{{ID: "e1", Ledger: 100, PagingToken: "pt-1"}},
+				LatestLedger: 500,
+			},
+			pageLimit:      10,
+			wantCursor:     "pt-1",
+			wantLedger:     100,
+			wantCaughtUp:   true,
+			wantPollNotNil: true,
+		},
+		{
+			name: "empty page with a cursor does not advance it",
+			resp: rpc.GetEventsResponse{
+				LatestLedger: 500,
+				Cursor:       "stale-cursor",
+			},
+			pageLimit:      100,
+			wantCursor:     "",
+			wantLedger:     499,
+			wantCaughtUp:   true,
+			wantPollNotNil: true,
+		},
+		{
+			name:           "empty page without a cursor stays put",
+			resp:           rpc.GetEventsResponse{LatestLedger: 42},
+			pageLimit:      100,
+			wantCursor:     "",
+			wantLedger:     41,
+			wantCaughtUp:   true,
+			wantPollNotNil: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			state, caughtUp := nextState(tt.resp, tt.pageLimit)
+			assert.Equal(t, tt.wantCursor, state.LastCursor)
+			assert.Equal(t, tt.wantLedger, state.LastIngestedLedger)
+			assert.Equal(t, tt.wantCaughtUp, caughtUp)
+			if tt.wantPollNotNil {
+				require.NotNil(t, state.LastSuccessfulPoll)
+			}
+		})
+	}
 }
 
 func TestIdempotentReIngest(t *testing.T) {
@@ -1519,4 +1636,146 @@ func TestRun_EmitsStartedAndStoppedLogs(t *testing.T) {
 	}
 	assert.Equal(t, 1, started, "exactly one started line")
 	assert.Equal(t, 1, stopped, "exactly one stopped line")
+}
+
+// --- Per-cycle structured summary (fetched / written / skipped) ---
+
+// cycleSummaries returns the parsed "poll cycle complete" records in order.
+func cycleSummaries(t *testing.T, buf *bytes.Buffer) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for _, rec := range logRecords(t, buf, nil) {
+		if rec["msg"] == "poll cycle complete" {
+			out = append(out, rec)
+		}
+	}
+	return out
+}
+
+// selectiveDecoder fails DecodeScVal for payloads containing failMarker, so a
+// test can force the dead-letter path without XDR fixtures.
+type selectiveDecoder struct{ failMarker string }
+
+func (d selectiveDecoder) DecodeScVal(xdr string) (json.RawMessage, error) {
+	if strings.Contains(xdr, d.failMarker) {
+		return nil, fmt.Errorf("undecodable %q", xdr)
+	}
+	return json.RawMessage(`"decoded"`), nil
+}
+
+// TestRunOnce_LogsCycleSummary covers the structured per-cycle summary: every
+// cycle emits exactly one line carrying fetched/written/skipped counts.
+func TestRunOnce_LogsCycleSummary(t *testing.T) {
+	xdrEvent := func(id, value string) rpc.Event {
+		return rpc.Event{
+			ID:         id,
+			Type:       "contract",
+			Ledger:     100,
+			ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+			Value:      value,
+		}
+	}
+
+	tests := []struct {
+		name        string
+		decoder     decode.Decoder
+		resp        rpc.GetEventsResponse
+		watch       int
+		pageLimit   uint
+		wantFetched float64
+		wantWritten float64
+		wantSkipped float64
+	}{
+		{
+			name:        "single page with events",
+			decoder:     passthroughDecoder{},
+			resp:        rpc.GetEventsResponse{Events: []rpc.Event{rpcEvent("e1", 100), rpcEvent("e2", 100), rpcEvent("e3", 100)}, LatestLedger: 500},
+			pageLimit:   100,
+			wantFetched: 3, wantWritten: 3, wantSkipped: 0,
+		},
+		{
+			name:        "empty page",
+			decoder:     passthroughDecoder{},
+			resp:        rpc.GetEventsResponse{LatestLedger: 500},
+			pageLimit:   100,
+			wantFetched: 0, wantWritten: 0, wantSkipped: 0,
+		},
+		{
+			name:        "undecodable event is skipped to the dead-letter sink",
+			decoder:     selectiveDecoder{failMarker: "bad"},
+			resp:        rpc.GetEventsResponse{Events: []rpc.Event{xdrEvent("good", "ok-xdr"), xdrEvent("bad", "bad-xdr")}, LatestLedger: 500},
+			pageLimit:   100,
+			wantFetched: 2, wantWritten: 1, wantSkipped: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			log, buf := recordingLogger()
+			client := &mockRPC{eventsResps: []rpc.GetEventsResponse{tt.resp}}
+			st := newMockStore()
+			for i := 0; i < tt.watch; i++ {
+				st.watched = append(st.watched, store.WatchedContract{ContractID: fmt.Sprintf("C%055d", i)})
+			}
+			ing := New(client, st, tt.decoder, log, Options{StartLedger: 100, PageLimit: tt.pageLimit})
+			ing.SetDeadLetterSink(st)
+
+			_, err := ing.runOnce(context.Background())
+			require.NoError(t, err)
+
+			recs := cycleSummaries(t, buf)
+			require.Len(t, recs, 1, "exactly one summary line per cycle")
+			assert.Equal(t, tt.wantFetched, recs[0]["fetched"])
+			assert.Equal(t, tt.wantWritten, recs[0]["written"])
+			assert.Equal(t, tt.wantSkipped, recs[0]["skipped"])
+		})
+	}
+}
+
+// TestRunOnce_LogsOneCycleSummaryForWindowSweep proves the multi-batch window
+// sweep still emits a single aggregated summary line rather than one per batch.
+func TestRunOnce_LogsOneCycleSummaryForWindowSweep(t *testing.T) {
+	log, buf := recordingLogger()
+	st := newMockStore()
+	for i := 0; i < 27; i++ { // >25 contracts forces multiple filter batches
+		st.watched = append(st.watched, store.WatchedContract{ContractID: fmt.Sprintf("C%055d", i)})
+	}
+	client := &mockRPC{
+		health: rpc.Health{Status: "healthy", LatestLedger: 5_000, OldestLedger: 10},
+		eventsResps: []rpc.GetEventsResponse{
+			{Events: []rpc.Event{rpcEvent("e1", 150)}, LatestLedger: 5_000},
+			{Events: []rpc.Event{rpcEvent("e2", 180)}, LatestLedger: 5_000},
+		},
+	}
+	ing := New(client, st, passthroughDecoder{}, log, Options{
+		StartLedger: 100, SweepWindow: 1_000, PageLimit: 100,
+	})
+
+	_, err := ing.runOnce(context.Background())
+	require.NoError(t, err)
+
+	recs := cycleSummaries(t, buf)
+	require.Len(t, recs, 1, "a 2-batch sweep must still log one cycle summary")
+	assert.Equal(t, float64(2), recs[0]["fetched"])
+	assert.Equal(t, float64(2), recs[0]["written"])
+	assert.Equal(t, float64(0), recs[0]["skipped"])
+}
+
+// TestRunOnce_CycleSummaryOnError proves a failing cycle still emits its one
+// summary line, tagged with the error, so the summary stream never has holes.
+func TestRunOnce_CycleSummaryOnError(t *testing.T) {
+	log, buf := recordingLogger()
+	client := &mockRPC{
+		eventsResps: []rpc.GetEventsResponse{{Events: []rpc.Event{rpcEvent("e1", 100)}, LatestLedger: 500}},
+		eventsErrs:  []error{fmt.Errorf("rpc unavailable")},
+	}
+	st := newMockStore()
+	ing := New(client, st, passthroughDecoder{}, log, Options{StartLedger: 100, PageLimit: 100})
+
+	_, err := ing.runOnce(context.Background())
+	require.Error(t, err)
+
+	recs := cycleSummaries(t, buf)
+	require.Len(t, recs, 1)
+	assert.Contains(t, recs[0]["error"], "rpc unavailable")
+	assert.Equal(t, float64(0), recs[0]["fetched"])
 }
