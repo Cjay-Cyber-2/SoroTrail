@@ -4,15 +4,15 @@ package store
 
 import (
 	"context"
-	"testing"
-
 	"encoding/json"
 	"fmt"
+	"os"
+	"testing"
+	"time"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"os"
-	"time"
 )
 
 const (
