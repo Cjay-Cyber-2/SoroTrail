@@ -18,9 +18,9 @@ func TestCanonicalLogFields(t *testing.T) {
 
 func TestSanitizeURL(t *testing.T) {
 	tests := []struct {
-		name   string
-		input  string
-		want   string
+		name  string
+		input string
+		want  string
 	}{
 		{
 			name:  "plain url unchanged",
