@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"sync/atomic"
 	"time"
+
+	"github.com/sorotrail/sorotrail/internal/requestid"
 )
 
 type GuardedStoreOptions struct {
@@ -43,7 +45,7 @@ func (s *guardedStore) wrapContext(ctx context.Context, name string) (context.Co
 	return context.WithTimeout(ctx, s.options.Timeout)
 }
 
-func (s *guardedStore) logSlowQuery(name string, start time.Time, err error) {
+func (s *guardedStore) logSlowQuery(ctx context.Context, name string, start time.Time, err error) {
 	if err != nil {
 		s.queryErrors.Add(1)
 	}
@@ -51,11 +53,16 @@ func (s *guardedStore) logSlowQuery(name string, start time.Time, err error) {
 	if duration < s.options.SlowQueryThreshold {
 		return
 	}
-	s.options.Logger.Warn("slow store query",
+	// The correlation id travels on the context, so a slow query is tagged
+	// with the HTTP request or background job that caused it without the
+	// store interface growing a parameter for it.
+	attrs := requestid.Attrs(ctx)
+	attrs = append(attrs,
 		"query", name,
 		"duration", duration,
 		"error", err,
 	)
+	s.options.Logger.Warn("slow store query", attrs...)
 }
 
 func (s *guardedStore) UpsertEvents(ctx context.Context, events []Event) (int64, error) {
@@ -63,7 +70,7 @@ func (s *guardedStore) UpsertEvents(ctx context.Context, events []Event) (int64,
 	defer cancel()
 	start := time.Now()
 	n, err := s.Store.UpsertEvents(ctx, events)
-	s.logSlowQuery("store.UpsertEvents", start, err)
+	s.logSlowQuery(ctx, "store.UpsertEvents", start, err)
 	return n, err
 }
 
@@ -72,7 +79,7 @@ func (s *guardedStore) ReplaceEventsInRange(ctx context.Context, events []Event,
 	defer cancel()
 	start := time.Now()
 	err := s.Store.ReplaceEventsInRange(ctx, events, fromLedger, toLedger)
-	s.logSlowQuery("store.ReplaceEventsInRange", start, err)
+	s.logSlowQuery(ctx, "store.ReplaceEventsInRange", start, err)
 	return err
 }
 
@@ -81,7 +88,7 @@ func (s *guardedStore) GetEvent(ctx context.Context, id string, sc Scope) (Event
 	defer cancel()
 	start := time.Now()
 	e, err := s.Store.GetEvent(ctx, id, sc)
-	s.logSlowQuery("store.GetEvent", start, err)
+	s.logSlowQuery(ctx, "store.GetEvent", start, err)
 	return e, err
 }
 
@@ -90,7 +97,7 @@ func (s *guardedStore) GetEventsByTxHash(ctx context.Context, txHash, excludeID 
 	defer cancel()
 	start := time.Now()
 	events, err := s.Store.GetEventsByTxHash(ctx, txHash, excludeID)
-	s.logSlowQuery("store.GetEventsByTxHash", start, err)
+	s.logSlowQuery(ctx, "store.GetEventsByTxHash", start, err)
 	return events, err
 }
 
@@ -99,7 +106,7 @@ func (s *guardedStore) EventExists(ctx context.Context, id string, sc Scope) (bo
 	defer cancel()
 	start := time.Now()
 	exists, err := s.Store.EventExists(ctx, id, sc)
-	s.logSlowQuery("store.EventExists", start, err)
+	s.logSlowQuery(ctx, "store.EventExists", start, err)
 	return exists, err
 }
 
@@ -108,7 +115,7 @@ func (s *guardedStore) QueryEvents(ctx context.Context, f EventFilter) ([]Event,
 	defer cancel()
 	start := time.Now()
 	events, cursor, err := s.Store.QueryEvents(ctx, f)
-	s.logSlowQuery("store.QueryEvents", start, err)
+	s.logSlowQuery(ctx, "store.QueryEvents", start, err)
 	return events, cursor, err
 }
 
@@ -117,7 +124,7 @@ func (s *guardedStore) CountEvents(ctx context.Context, f EventFilter) (int64, e
 	defer cancel()
 	start := time.Now()
 	total, err := s.Store.CountEvents(ctx, f)
-	s.logSlowQuery("store.CountEvents", start, err)
+	s.logSlowQuery(ctx, "store.CountEvents", start, err)
 	return total, err
 }
 
@@ -126,7 +133,7 @@ func (s *guardedStore) LedgerRangeCensus(ctx context.Context, fromLedger, toLedg
 	defer cancel()
 	start := time.Now()
 	census, err := s.Store.LedgerRangeCensus(ctx, fromLedger, toLedger, idsOnly)
-	s.logSlowQuery("store.LedgerRangeCensus", start, err)
+	s.logSlowQuery(ctx, "store.LedgerRangeCensus", start, err)
 	return census, err
 }
 
@@ -135,7 +142,7 @@ func (s *guardedStore) AggregateEvents(ctx context.Context, f EventFilter, bucke
 	defer cancel()
 	start := time.Now()
 	buckets, err := s.Store.AggregateEvents(ctx, f, bucket)
-	s.logSlowQuery("store.AggregateEvents", start, err)
+	s.logSlowQuery(ctx, "store.AggregateEvents", start, err)
 	return buckets, err
 }
 
@@ -144,7 +151,7 @@ func (s *guardedStore) GetIngestionState(ctx context.Context) (IngestionState, e
 	defer cancel()
 	start := time.Now()
 	state, err := s.Store.GetIngestionState(ctx)
-	s.logSlowQuery("store.GetIngestionState", start, err)
+	s.logSlowQuery(ctx, "store.GetIngestionState", start, err)
 	return state, err
 }
 
@@ -153,7 +160,7 @@ func (s *guardedStore) SaveIngestionState(ctx context.Context, state IngestionSt
 	defer cancel()
 	start := time.Now()
 	err := s.Store.SaveIngestionState(ctx, state)
-	s.logSlowQuery("store.SaveIngestionState", start, err)
+	s.logSlowQuery(ctx, "store.SaveIngestionState", start, err)
 	return err
 }
 
@@ -162,7 +169,7 @@ func (s *guardedStore) GetAuditState(ctx context.Context, network string) (Audit
 	defer cancel()
 	start := time.Now()
 	state, err := s.Store.GetAuditState(ctx, network)
-	s.logSlowQuery("store.GetAuditState", start, err)
+	s.logSlowQuery(ctx, "store.GetAuditState", start, err)
 	return state, err
 }
 
@@ -171,7 +178,7 @@ func (s *guardedStore) SaveAuditState(ctx context.Context, state AuditState) err
 	defer cancel()
 	start := time.Now()
 	err := s.Store.SaveAuditState(ctx, state)
-	s.logSlowQuery("store.SaveAuditState", start, err)
+	s.logSlowQuery(ctx, "store.SaveAuditState", start, err)
 	return err
 }
 
@@ -180,7 +187,7 @@ func (s *guardedStore) SaveAuditStateIfGreater(ctx context.Context, network stri
 	defer cancel()
 	start := time.Now()
 	state, err := s.Store.SaveAuditStateIfGreater(ctx, network, ledger)
-	s.logSlowQuery("store.SaveAuditStateIfGreater", start, err)
+	s.logSlowQuery(ctx, "store.SaveAuditStateIfGreater", start, err)
 	return state, err
 }
 
@@ -189,7 +196,7 @@ func (s *guardedStore) GetContractSummary(ctx context.Context, contractID string
 	defer cancel()
 	start := time.Now()
 	summary, err := s.Store.GetContractSummary(ctx, contractID)
-	s.logSlowQuery("store.GetContractSummary", start, err)
+	s.logSlowQuery(ctx, "store.GetContractSummary", start, err)
 	return summary, err
 }
 
@@ -198,7 +205,7 @@ func (s *guardedStore) ContractEventTypeCounts(ctx context.Context, contractID s
 	defer cancel()
 	start := time.Now()
 	counts, err := s.Store.ContractEventTypeCounts(ctx, contractID)
-	s.logSlowQuery("store.ContractEventTypeCounts", start, err)
+	s.logSlowQuery(ctx, "store.ContractEventTypeCounts", start, err)
 	return counts, err
 }
 
@@ -207,7 +214,7 @@ func (s *guardedStore) ListContracts(ctx context.Context, f ContractsFilter) ([]
 	defer cancel()
 	start := time.Now()
 	summaries, cursor, err := s.Store.ListContracts(ctx, f)
-	s.logSlowQuery("store.ListContracts", start, err)
+	s.logSlowQuery(ctx, "store.ListContracts", start, err)
 	return summaries, cursor, err
 }
 
@@ -216,7 +223,7 @@ func (s *guardedStore) CountContracts(ctx context.Context, f ContractsFilter) (i
 	defer cancel()
 	start := time.Now()
 	total, err := s.Store.CountContracts(ctx, f)
-	s.logSlowQuery("store.CountContracts", start, err)
+	s.logSlowQuery(ctx, "store.CountContracts", start, err)
 	return total, err
 }
 
@@ -225,7 +232,7 @@ func (s *guardedStore) ListWatchedContracts(ctx context.Context) ([]WatchedContr
 	defer cancel()
 	start := time.Now()
 	ids, err := s.Store.ListWatchedContracts(ctx)
-	s.logSlowQuery("store.ListWatchedContracts", start, err)
+	s.logSlowQuery(ctx, "store.ListWatchedContracts", start, err)
 	return ids, err
 }
 
@@ -234,7 +241,7 @@ func (s *guardedStore) AddWatchedContract(ctx context.Context, contractID string
 	defer cancel()
 	start := time.Now()
 	err := s.Store.AddWatchedContract(ctx, contractID)
-	s.logSlowQuery("store.AddWatchedContract", start, err)
+	s.logSlowQuery(ctx, "store.AddWatchedContract", start, err)
 	return err
 }
 
@@ -243,7 +250,7 @@ func (s *guardedStore) RemoveWatchedContract(ctx context.Context, contractID str
 	defer cancel()
 	start := time.Now()
 	err := s.Store.RemoveWatchedContract(ctx, contractID)
-	s.logSlowQuery("store.RemoveWatchedContract", start, err)
+	s.logSlowQuery(ctx, "store.RemoveWatchedContract", start, err)
 	return err
 }
 
@@ -252,7 +259,7 @@ func (s *guardedStore) RecordAuditFinding(ctx context.Context, f AuditFinding) (
 	defer cancel()
 	start := time.Now()
 	finding, err := s.Store.RecordAuditFinding(ctx, f)
-	s.logSlowQuery("store.RecordAuditFinding", start, err)
+	s.logSlowQuery(ctx, "store.RecordAuditFinding", start, err)
 	return finding, err
 }
 
@@ -261,7 +268,7 @@ func (s *guardedStore) UpdateAuditFinding(ctx context.Context, f AuditFinding) e
 	defer cancel()
 	start := time.Now()
 	err := s.Store.UpdateAuditFinding(ctx, f)
-	s.logSlowQuery("store.UpdateAuditFinding", start, err)
+	s.logSlowQuery(ctx, "store.UpdateAuditFinding", start, err)
 	return err
 }
 
@@ -270,7 +277,7 @@ func (s *guardedStore) ListOpenFindingsByRange(ctx context.Context, network stri
 	defer cancel()
 	start := time.Now()
 	finding, err := s.Store.ListOpenFindingsByRange(ctx, network, fromLedger, toLedger)
-	s.logSlowQuery("store.ListOpenFindingsByRange", start, err)
+	s.logSlowQuery(ctx, "store.ListOpenFindingsByRange", start, err)
 	return finding, err
 }
 
@@ -279,7 +286,7 @@ func (s *guardedStore) CreateSubscription(ctx context.Context, sub Subscription)
 	defer cancel()
 	start := time.Now()
 	created, err := s.Store.CreateSubscription(ctx, sub)
-	s.logSlowQuery("store.CreateSubscription", start, err)
+	s.logSlowQuery(ctx, "store.CreateSubscription", start, err)
 	return created, err
 }
 
@@ -288,7 +295,7 @@ func (s *guardedStore) GetSubscription(ctx context.Context, id int64, owner Subs
 	defer cancel()
 	start := time.Now()
 	sub, err := s.Store.GetSubscription(ctx, id, owner)
-	s.logSlowQuery("store.GetSubscription", start, err)
+	s.logSlowQuery(ctx, "store.GetSubscription", start, err)
 	return sub, err
 }
 
@@ -297,7 +304,7 @@ func (s *guardedStore) ListSubscriptions(ctx context.Context, owner Subscription
 	defer cancel()
 	start := time.Now()
 	subs, err := s.Store.ListSubscriptions(ctx, owner)
-	s.logSlowQuery("store.ListSubscriptions", start, err)
+	s.logSlowQuery(ctx, "store.ListSubscriptions", start, err)
 	return subs, err
 }
 
@@ -306,7 +313,7 @@ func (s *guardedStore) UpdateSubscription(ctx context.Context, sub Subscription,
 	defer cancel()
 	start := time.Now()
 	updated, err := s.Store.UpdateSubscription(ctx, sub, owner)
-	s.logSlowQuery("store.UpdateSubscription", start, err)
+	s.logSlowQuery(ctx, "store.UpdateSubscription", start, err)
 	return updated, err
 }
 
@@ -315,7 +322,7 @@ func (s *guardedStore) DeleteSubscription(ctx context.Context, id int64, owner S
 	defer cancel()
 	start := time.Now()
 	err := s.Store.DeleteSubscription(ctx, id, owner)
-	s.logSlowQuery("store.DeleteSubscription", start, err)
+	s.logSlowQuery(ctx, "store.DeleteSubscription", start, err)
 	return err
 }
 
@@ -324,7 +331,7 @@ func (s *guardedStore) ListEnabledSubscriptions(ctx context.Context) ([]Subscrip
 	defer cancel()
 	start := time.Now()
 	subs, err := s.Store.ListEnabledSubscriptions(ctx)
-	s.logSlowQuery("store.ListEnabledSubscriptions", start, err)
+	s.logSlowQuery(ctx, "store.ListEnabledSubscriptions", start, err)
 	return subs, err
 }
 
@@ -333,7 +340,7 @@ func (s *guardedStore) IncrementSubscriptionFailures(ctx context.Context, id int
 	defer cancel()
 	start := time.Now()
 	count, disabled, err := s.Store.IncrementSubscriptionFailures(ctx, id, maxFailures)
-	s.logSlowQuery("store.IncrementSubscriptionFailures", start, err)
+	s.logSlowQuery(ctx, "store.IncrementSubscriptionFailures", start, err)
 	return count, disabled, err
 }
 
@@ -342,7 +349,7 @@ func (s *guardedStore) ResetSubscriptionFailures(ctx context.Context, id int64) 
 	defer cancel()
 	start := time.Now()
 	err := s.Store.ResetSubscriptionFailures(ctx, id)
-	s.logSlowQuery("store.ResetSubscriptionFailures", start, err)
+	s.logSlowQuery(ctx, "store.ResetSubscriptionFailures", start, err)
 	return err
 }
 
@@ -351,7 +358,7 @@ func (s *guardedStore) RecordDeliveryAttempt(ctx context.Context, a DeliveryAtte
 	defer cancel()
 	start := time.Now()
 	attempt, err := s.Store.RecordDeliveryAttempt(ctx, a)
-	s.logSlowQuery("store.RecordDeliveryAttempt", start, err)
+	s.logSlowQuery(ctx, "store.RecordDeliveryAttempt", start, err)
 	return attempt, err
 }
 
@@ -360,7 +367,7 @@ func (s *guardedStore) ListDeliveryAttempts(ctx context.Context, subscriptionID 
 	defer cancel()
 	start := time.Now()
 	attempts, err := s.Store.ListDeliveryAttempts(ctx, subscriptionID, limit, owner)
-	s.logSlowQuery("store.ListDeliveryAttempts", start, err)
+	s.logSlowQuery(ctx, "store.ListDeliveryAttempts", start, err)
 	return attempts, err
 }
 
@@ -369,7 +376,7 @@ func (s *guardedStore) GetContractSpec(ctx context.Context, wasmHash string) ([]
 	defer cancel()
 	start := time.Now()
 	spec, err := s.Store.GetContractSpec(ctx, wasmHash)
-	s.logSlowQuery("store.GetContractSpec", start, err)
+	s.logSlowQuery(ctx, "store.GetContractSpec", start, err)
 	return spec, err
 }
 
@@ -378,7 +385,7 @@ func (s *guardedStore) SetContractSpec(ctx context.Context, wasmHash, contractID
 	defer cancel()
 	start := time.Now()
 	err := s.Store.SetContractSpec(ctx, wasmHash, contractID, specJSON)
-	s.logSlowQuery("store.SetContractSpec", start, err)
+	s.logSlowQuery(ctx, "store.SetContractSpec", start, err)
 	return err
 }
 
@@ -387,7 +394,7 @@ func (s *guardedStore) GetContractSpecOverride(ctx context.Context, contractID s
 	defer cancel()
 	start := time.Now()
 	spec, err := s.Store.GetContractSpecOverride(ctx, contractID)
-	s.logSlowQuery("store.GetContractSpecOverride", start, err)
+	s.logSlowQuery(ctx, "store.GetContractSpecOverride", start, err)
 	return spec, err
 }
 
@@ -396,7 +403,7 @@ func (s *guardedStore) SetContractSpecOverride(ctx context.Context, contractID s
 	defer cancel()
 	start := time.Now()
 	err := s.Store.SetContractSpecOverride(ctx, contractID, specJSON)
-	s.logSlowQuery("store.SetContractSpecOverride", start, err)
+	s.logSlowQuery(ctx, "store.SetContractSpecOverride", start, err)
 	return err
 }
 
@@ -405,7 +412,7 @@ func (s *guardedStore) DeleteContractSpecOverride(ctx context.Context, contractI
 	defer cancel()
 	start := time.Now()
 	err := s.Store.DeleteContractSpecOverride(ctx, contractID)
-	s.logSlowQuery("store.DeleteContractSpecOverride", start, err)
+	s.logSlowQuery(ctx, "store.DeleteContractSpecOverride", start, err)
 	return err
 }
 
@@ -414,7 +421,7 @@ func (s *guardedStore) DeleteEventsBeforeLedger(ctx context.Context, beforeLedge
 	defer cancel()
 	start := time.Now()
 	n, err := s.Store.DeleteEventsBeforeLedger(ctx, beforeLedger)
-	s.logSlowQuery("store.DeleteEventsBeforeLedger", start, err)
+	s.logSlowQuery(ctx, "store.DeleteEventsBeforeLedger", start, err)
 	return n, err
 }
 
@@ -423,7 +430,7 @@ func (s *guardedStore) DeleteEventsBefore(ctx context.Context, maxLedger int64, 
 	defer cancel()
 	start := time.Now()
 	n, err := s.Store.DeleteEventsBefore(ctx, maxLedger, beforeTime, limit)
-	s.logSlowQuery("store.DeleteEventsBefore", start, err)
+	s.logSlowQuery(ctx, "store.DeleteEventsBefore", start, err)
 	return n, err
 }
 
@@ -432,7 +439,7 @@ func (s *guardedStore) CountEventsBefore(ctx context.Context, maxLedger int64, b
 	defer cancel()
 	start := time.Now()
 	n, err := s.Store.CountEventsBefore(ctx, maxLedger, beforeTime, limit)
-	s.logSlowQuery("store.CountEventsBefore", start, err)
+	s.logSlowQuery(ctx, "store.CountEventsBefore", start, err)
 	return n, err
 }
 func (s *guardedStore) MigrationVersion(ctx context.Context) (int, bool, error) {
@@ -445,7 +452,7 @@ func (s *guardedStore) Stats(ctx context.Context, sc Scope) (Stats, error) {
 	defer cancel()
 	start := time.Now()
 	stats, err := s.Store.Stats(ctx, sc)
-	s.logSlowQuery("store.Stats", start, err)
+	s.logSlowQuery(ctx, "store.Stats", start, err)
 	stats.QueryErrors = s.queryErrors.Load()
 	return stats, err
 }
@@ -455,7 +462,7 @@ func (s *guardedStore) Ping(ctx context.Context) error {
 	defer cancel()
 	start := time.Now()
 	err := s.Store.Ping(ctx)
-	s.logSlowQuery("store.Ping", start, err)
+	s.logSlowQuery(ctx, "store.Ping", start, err)
 	return err
 }
 
@@ -464,7 +471,7 @@ func (s *guardedStore) UpsertAddressRefs(ctx context.Context, refs []AddressRef)
 	defer cancel()
 	start := time.Now()
 	err := s.Store.UpsertAddressRefs(ctx, refs)
-	s.logSlowQuery("store.UpsertAddressRefs", start, err)
+	s.logSlowQuery(ctx, "store.UpsertAddressRefs", start, err)
 	return err
 }
 
@@ -473,7 +480,7 @@ func (s *guardedStore) QueryAddressEvents(ctx context.Context, address string, f
 	defer cancel()
 	start := time.Now()
 	events, cursor, err := s.Store.QueryAddressEvents(ctx, address, f)
-	s.logSlowQuery("store.QueryAddressEvents", start, err)
+	s.logSlowQuery(ctx, "store.QueryAddressEvents", start, err)
 	return events, cursor, err
 }
 
@@ -482,7 +489,7 @@ func (s *guardedStore) CountAddressEvents(ctx context.Context, address string) (
 	defer cancel()
 	start := time.Now()
 	total, err := s.Store.CountAddressEvents(ctx, address)
-	s.logSlowQuery("store.CountAddressEvents", start, err)
+	s.logSlowQuery(ctx, "store.CountAddressEvents", start, err)
 	return total, err
 }
 
@@ -491,7 +498,7 @@ func (s *guardedStore) CountDeadLetters(ctx context.Context, contractID string) 
 	defer cancel()
 	start := time.Now()
 	total, err := s.Store.CountDeadLetters(ctx, contractID)
-	s.logSlowQuery("store.CountDeadLetters", start, err)
+	s.logSlowQuery(ctx, "store.CountDeadLetters", start, err)
 	return total, err
 }
 
@@ -500,7 +507,7 @@ func (s *guardedStore) CountDeliveryAttempts(ctx context.Context, subscriptionID
 	defer cancel()
 	start := time.Now()
 	total, err := s.Store.CountDeliveryAttempts(ctx, subscriptionID, owner)
-	s.logSlowQuery("store.CountDeliveryAttempts", start, err)
+	s.logSlowQuery(ctx, "store.CountDeliveryAttempts", start, err)
 	return total, err
 }
 
@@ -509,6 +516,6 @@ func (s *guardedStore) GetAddressSummary(ctx context.Context, address string) (A
 	defer cancel()
 	start := time.Now()
 	summary, err := s.Store.GetAddressSummary(ctx, address)
-	s.logSlowQuery("store.GetAddressSummary", start, err)
+	s.logSlowQuery(ctx, "store.GetAddressSummary", start, err)
 	return summary, err
 }

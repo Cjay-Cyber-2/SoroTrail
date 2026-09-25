@@ -41,6 +41,7 @@ import (
 	"github.com/sorotrail/sorotrail/internal/broadcast"
 	"github.com/sorotrail/sorotrail/internal/decode"
 	"github.com/sorotrail/sorotrail/internal/metrics"
+	"github.com/sorotrail/sorotrail/internal/requestid"
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
 )
@@ -398,10 +399,13 @@ func New(client rpc.Client, st store.Store, dec decode.Decoder, log *slog.Logger
 		skipMap[id] = true
 	}
 	ing := &Ingester{
-		client:        client,
-		store:         st,
-		decoder:       dec,
-		log:           log,
+		client:  client,
+		store:   st,
+		decoder: dec,
+		// Stamp the ingester's stable job id on every line it emits, so a
+		// log stream identifies background work with the same field HTTP
+		// requests use for their request id.
+		log:           log.With(requestid.Field, requestid.JobIngester),
 		opts:          opts,
 		skipContracts: skipMap,
 		tracer:        noop.NewTracerProvider().Tracer("github.com/sorotrail/sorotrail/internal/ingester"),
@@ -525,6 +529,9 @@ func (ing *Ingester) backoffSleep(backoff time.Duration) time.Duration {
 // batch. There is no place in the loop where a partial state lands in
 // the store, so a tranquil Ctrl-C / SIGTERM never truncates a write.
 func (ing *Ingester) Run(ctx context.Context) (err error) {
+	// Carry the job id on the context too, so the store and RPC decorators
+	// tag their slow-query and error logs from this loop with "ingester".
+	ctx = requestid.WithJob(ctx, requestid.JobIngester)
 	ing.log.Info("ingester started", ing.opts.logAttrs()...)
 	defer func() {
 		if err != nil {
