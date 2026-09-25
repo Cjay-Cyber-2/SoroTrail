@@ -34,8 +34,9 @@ func Migrate(databaseURL string) error {
 // MigrateUp applies pending migrations. steps > 0 applies at most that many
 // migrations; steps <= 0 applies every pending migration.
 //
-// ClickHouse has no migration series and is a no-op. SQLite runs the embedded
-// SQLite series; Postgres runs the embedded Postgres series via golang-migrate.
+// ClickHouse runs the embedded ClickHouse series (apply-only). SQLite runs the
+// embedded SQLite series; Postgres runs the embedded Postgres series via
+// golang-migrate (and honors steps).
 func MigrateUp(databaseURL string, steps int) error {
 	if strings.HasPrefix(databaseURL, "clickhouse://") {
 		return migrateClickHouse(databaseURL)
@@ -70,7 +71,7 @@ func MigrateUp(databaseURL string, steps int) error {
 // which is why `migrate down` defaults to a single step at the CLI layer).
 func MigrateDown(databaseURL string, steps int) error {
 	if strings.HasPrefix(databaseURL, "clickhouse://") {
-		return errors.New("clickhouse has no migration series; nothing to roll back")
+		return errors.New("clickhouse migrations are apply-only; nothing to roll back")
 	}
 	if isSQLiteURL(databaseURL) {
 		return migrateSQLiteDown(databaseURL, steps)
@@ -101,7 +102,7 @@ func MigrateDown(databaseURL string, steps int) error {
 // versions still pending, without mutating the database.
 func MigrateStatus(databaseURL string) (MigrationStatus, error) {
 	if strings.HasPrefix(databaseURL, "clickhouse://") {
-		return MigrationStatus{}, errors.New("clickhouse has no migration series; no status available")
+		return MigrationStatus{}, errors.New("clickhouse migration status is not supported")
 	}
 	if isSQLiteURL(databaseURL) {
 		return migrateSQLiteStatus(databaseURL)

@@ -122,6 +122,8 @@ subcommands:
                    (sorotrail backfill --help)
   index-addresses  rebuild the address→event inverted index from stored events
                    (sorotrail index-addresses --help)
+  migrate          apply, roll back, or inspect database migrations
+                   (sorotrail migrate --help)
   health           probe the API /health and exit nonzero on failure
                    (sorotrail health --help)
   healthcheck      probe /health and exit (used by docker HEALTHCHECK)

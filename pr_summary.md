@@ -131,6 +131,13 @@ go test -race ./internal/ingester/... ./internal/decode/... ./internal/store/   
 ## Notes
 
 - No schema, config, or endpoint changes.
+- The branch is kept in sync with upstream `main`. Upstream added read-only
+  `sorotrail migrate-status`; `sorotrail migrate status` complements it by
+  sharing the same `store.MigrateStatus` result while adding `up`/`down`.
+- ClickHouse URLs have an apply-only migration series, so `migrate up` runs it
+  while `migrate down`/`status` report that it is unsupported.
 - The `Makefile` `migrate-up`/`migrate-down` targets still shell out to the
   `migrate` binary; they are left untouched to avoid changing existing
   workflows. They could be repointed at `sorotrail migrate` in a follow-up.
+- `deploy/helm/sorotrail` golden tests can differ locally with a mismatched
+  local Helm version; the CI `helm` job is unaffected.
