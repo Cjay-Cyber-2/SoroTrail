@@ -1,8 +1,9 @@
 package graphql
 
 import (
-	"github.com/stretchr/testify/assert"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func FuzzParseCursor(f *testing.F) {
