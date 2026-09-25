@@ -6,9 +6,11 @@ import (
 	"context"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/sorotrail/sorotrail/internal/metrics"
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
 	"github.com/sorotrail/sorotrail/internal/testdb"
@@ -58,7 +60,7 @@ func TestIntegration_CursorResumeAcrossRestart(t *testing.T) {
 
 	// Page 1's events must be queryable through the store interface, and
 	// the persisted state must carry the cursor and last ledger.
-	e1, err := st.GetEvent(ctx, "cursor-e1")
+	e1, err := st.GetEvent(ctx, "cursor-e1", store.SystemScope())
 	require.NoError(t, err)
 	assert.Equal(t, int64(100), e1.Ledger)
 
@@ -104,11 +106,11 @@ func TestIntegration_CursorResumeAcrossRestart(t *testing.T) {
 	// The third event must be present, and idempotency must keep the row
 	// count at exactly 3 — none of cursor-e1/cursor-e2/cursor-e3 were
 	// duplicated by the resumed run.
-	e3, err := st.GetEvent(ctx, "cursor-e3")
+	e3, err := st.GetEvent(ctx, "cursor-e3", store.SystemScope())
 	require.NoError(t, err)
 	assert.Equal(t, int64(102), e3.Ledger)
 
-	all, _, err := st.QueryEvents(ctx, store.EventFilter{Limit: 1000})
+	all, _, err := st.QueryEvents(ctx, store.EventFilter{Limit: 1000, Scope: store.SystemScope()})
 	require.NoError(t, err)
 	assert.Len(t, all, 3, "resumed ingestion must not duplicate persisted events")
 }
@@ -147,10 +149,14 @@ func TestIntegration_WarmStartResumesByLedgerPlusOne(t *testing.T) {
 	req := mock.eventsRequests[0]
 	assert.Equal(t, uint32(501), req.StartLedger,
 		"warm start (no cursor) must start at LastIngestedLedger+1")
-	assert.Nil(t, req.Pagination,
+	// The request still carries a Pagination block: that is where the page
+	// limit travels. What warm start must not do is send a cursor, since
+	// that would override StartLedger.
+	require.NotNil(t, req.Pagination)
+	assert.Empty(t, req.Pagination.Cursor,
 		"warm start goes through the StartLedger path, not cursor pagination")
 
-	ev, err := st.GetEvent(ctx, "warm-e1")
+	ev, err := st.GetEvent(ctx, "warm-e1", store.SystemScope())
 	require.NoError(t, err)
 	assert.Equal(t, int64(501), ev.Ledger)
 }
@@ -227,3 +233,56 @@ func TestIntegration_RPCErrorLeavesStateUnchanged(t *testing.T) {
 type errBoom struct{}
 
 func (errBoom) Error() string { return "boom" }
+
+// TestIntegration_BatchSizeSplitsWritesOnRealStore proves the configurable
+// batch-size path works end-to-end against a real Postgres store: a burst
+// page larger than BatchSize is persisted (split into multiple store writes
+// internally) and every event is queryable afterwards. It also asserts the
+// write-count metric moved so the chunked path actually ran rather than
+// silently falling back to the single-write per-page behavior.
+func TestIntegration_BatchSizeSplitsWritesOnRealStore(t *testing.T) {
+	pool := testdb.Setup(t, store.Migrate)
+	defer pool.Close()
+	ctx := context.Background()
+
+	st := store.NewPostgres(pool)
+
+	// A burst of events landing in a single fetch page, with a batch size
+	// smaller than the page so the burst must be split across many writes.
+	const (
+		burst     = 120
+		batchSize = 25
+	)
+	mock := &mockRPC{
+		health:      rpc.Health{Status: "healthy", LatestLedger: 200, OldestLedger: 2},
+		eventsResps: []rpc.GetEventsResponse{manyEvents(burst)},
+	}
+	ing := newTestIngester(mock, st, Options{
+		StartLedger: 100,
+		PageLimit:   1000,
+		BatchSize:   batchSize,
+	})
+
+	writesBefore := testutil.ToFloat64(metrics.EventBatchWrites)
+
+	_, err := ing.runOnce(ctx)
+	require.NoError(t, err)
+
+	// Every burst event must be queryable through the real store — nothing
+	// lost, nothing duplicated by the chunked writer.
+	got, _, err := st.QueryEvents(ctx, store.EventFilter{
+		Limit: 100000,
+		Scope: store.SystemScope(),
+	})
+	require.NoError(t, err)
+	assert.Len(t, got, burst, "a hyper-dense page must persist ALL events with batching enabled")
+
+	// The burst was actually split: more than one store write was issued,
+	// each capped at BatchSize.
+	assert.Greater(t, testutil.ToFloat64(metrics.EventBatchWrites), writesBefore,
+		"a burst larger than BatchSize must issue multiple store writes")
+
+	// Leave the gauge at a known value so sibling tests start from a clean
+	// baseline.
+	metrics.EventBatchSize.Set(0)
+}

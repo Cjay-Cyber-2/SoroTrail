@@ -145,6 +145,10 @@ type mockStore struct {
 	ingestErr error
 	// upsertErr, when set, is returned by UpsertEvents.
 	upsertErr error
+	// upsertDelay, when > 0, makes UpsertEvents take that long, simulating
+	// a slow database so tests can drive the ingester's latency-based
+	// backpressure against a real (short) sleep rather than mocking time.
+	upsertDelay time.Duration
 	// contractCursors backs the per-contract cursor methods.
 	contractCursors []store.ContractCursor
 }
@@ -153,7 +157,19 @@ func newMockStore() *mockStore {
 	return &mockStore{events: map[string]store.Event{}}
 }
 
-func (m *mockStore) UpsertEvents(_ context.Context, events []store.Event) (int64, error) {
+func (m *mockStore) UpsertEvents(ctx context.Context, events []store.Event) (int64, error) {
+	if m.upsertDelay > 0 {
+		// Simulate a slow store write WITHOUT holding the store mutex, so
+		// tests asserting on other fields (upserted, events) don't block
+		// until the delay elapses.
+		timer := time.NewTimer(m.upsertDelay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-timer.C:
+		}
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.upsertErr != nil {
@@ -168,6 +184,10 @@ func (m *mockStore) UpsertEvents(_ context.Context, events []store.Event) (int64
 		}
 	}
 	return inserted, nil
+}
+
+func (m *mockStore) PruneEventsBefore(context.Context, time.Time) (int64, error) {
+	return 0, nil
 }
 
 func (m *mockStore) ReplaceEventsInRange(_ context.Context, events []store.Event, fromLedger, toLedger int64) error {
@@ -398,6 +418,21 @@ func (m *mockStore) ListDeliveryAttempts(context.Context, int64, int, store.Subs
 	return nil, nil
 }
 
+// API key stubs for the auth feature — unused by ingester tests.
+func (m *mockStore) CreateAPIKey(_ context.Context, k store.APIKey) (store.APIKey, error) {
+	k.ID = 1
+	return k, nil
+}
+func (m *mockStore) GetAPIKey(context.Context, int64) (store.APIKey, error) {
+	return store.APIKey{}, store.ErrNotFound
+}
+func (m *mockStore) LookupAPIKeyByPrefix(context.Context, string) (store.APIKey, error) {
+	return store.APIKey{}, store.ErrNotFound
+}
+func (m *mockStore) ListAPIKeys(context.Context) ([]store.APIKey, error) {
+	return nil, nil
+}
+func (m *mockStore) RevokeAPIKey(context.Context, int64) error { return nil }
 func (m *mockStore) ListContracts(context.Context, store.ContractsFilter) ([]store.ContractSummary, string, error) {
 	return nil, "", nil
 }
@@ -437,4 +472,8 @@ func (m *mockStore) QueryAddressEvents(context.Context, string, store.EventFilte
 func (m *mockStore) CountAddressEvents(context.Context, string) (int64, error) { return 0, nil }
 func (m *mockStore) GetAddressSummary(context.Context, string) (store.AddressSummary, error) {
 	return store.AddressSummary{}, nil
+}
+
+func (m *mockStore) CountEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
+	return 0, nil
 }

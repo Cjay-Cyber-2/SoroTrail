@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -37,6 +38,41 @@ func TestEventsIngestedTotal_SingleSuccess(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, before+3, testutil.ToFloat64(metrics.EventsIngested),
 		"counter must equal the number of events persisted in one successful write")
+}
+
+func TestWriteBatchSize(t *testing.T) {
+	tests := []struct {
+		name      string
+		batchSize uint
+		wantSizes []int
+	}{
+		{name: "default writes one batch", wantSizes: []int{5}},
+		{name: "configured size splits writes", batchSize: 2, wantSizes: []int{2, 2, 1}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &mockRPC{eventsResps: []rpc.GetEventsResponse{{
+				Events: []rpc.Event{
+					rpcEvent("e1", 100), rpcEvent("e2", 100), rpcEvent("e3", 100),
+					rpcEvent("e4", 100), rpcEvent("e5", 100),
+				},
+				LatestLedger: 500,
+			}}}
+			st := newMockStore()
+			ing := newTestIngester(client, st, Options{
+				StartLedger:    100,
+				PageLimit:      100,
+				WriteBatchSize: tt.batchSize,
+			})
+
+			_, err := ing.runOnce(context.Background())
+			require.NoError(t, err)
+			require.Len(t, st.upserted, len(tt.wantSizes))
+			for i, wantSize := range tt.wantSizes {
+				assert.Len(t, st.upserted[i], wantSize)
+			}
+		})
+	}
 }
 
 // TestSetIngestionLag covers the #237 gauge: it must be the difference
@@ -289,6 +325,30 @@ func TestColdStart_ExplicitStartLedgerOverrides(t *testing.T) {
 	assert.Equal(t, uint32(1_234), client.eventsRequests[0].StartLedger)
 }
 
+func TestWarmStart_ExplicitStartLedgerOverrides(t *testing.T) {
+	client := &mockRPC{eventsResps: []rpc.GetEventsResponse{
+		{LatestLedger: 10_000},
+		{LatestLedger: 10_000},
+	}}
+	st := newMockStore()
+	require.NoError(t, st.SaveIngestionState(context.Background(),
+		store.IngestionState{LastIngestedLedger: 500, LastCursor: "cursor-42"}))
+	ing := newTestIngester(client, st, Options{StartLedger: 1_234})
+
+	_, err := ing.runOnce(context.Background())
+	require.NoError(t, err)
+	// It should use StartLedger, ignoring the warm start cursor.
+	assert.Equal(t, uint32(1_234), client.eventsRequests[0].StartLedger)
+	if client.eventsRequests[0].Pagination != nil {
+		assert.Empty(t, client.eventsRequests[0].Pagination.Cursor)
+	}
+
+	// On the second runOnce, it should use the new warm state (the override was consumed).
+	_, err = ing.runOnce(context.Background())
+	require.NoError(t, err)
+	assert.NotEqual(t, uint32(1_234), client.eventsRequests[1].StartLedger, "override should be consumed")
+}
+
 func TestWarmStart_ResumesAfterLastIngestedLedger(t *testing.T) {
 	client := &mockRPC{eventsResps: []rpc.GetEventsResponse{{LatestLedger: 1_000}}}
 	st := newMockStore()
@@ -314,6 +374,50 @@ func TestWarmStart_ResumesFromCursor(t *testing.T) {
 	require.NotNil(t, req.Pagination)
 	assert.Equal(t, "cursor-42", req.Pagination.Cursor)
 	assert.Zero(t, req.StartLedger, "cursor and startLedger are mutually exclusive")
+}
+
+// TestSuccessfulCycle_RecordsLastSuccessfulPoll verifies that a completed
+// (error-free) poll cycle stamps ingestion_state with a fresh
+// last_successful_poll timestamp so operators can detect a stalled indexer
+// (a poll that never fires). Table-driven over the two shapes a successful
+// cycle takes: a page that carried events and a caught-up page that did not.
+func TestSuccessfulCycle_RecordsLastSuccessfulPoll(t *testing.T) {
+	tests := []struct {
+		name     string
+		events   []rpc.Event
+		caughtUp bool
+	}{
+		{name: "page with events is caught up on short page", events: []rpc.Event{rpcEvent("e1", 100)}, caughtUp: true},
+		{name: "caught-up page with no events", events: nil, caughtUp: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &mockRPC{
+				health: rpc.Health{Status: "healthy", LatestLedger: 1_000},
+				eventsResps: []rpc.GetEventsResponse{{
+					Events:       tt.events,
+					LatestLedger: 1_000,
+				}},
+			}
+			st := newMockStore()
+			ing := newTestIngester(client, st, Options{})
+			before := time.Now().Add(-time.Second)
+			after := time.Now().Add(time.Second)
+
+			caughtUp, err := ing.runOnce(context.Background())
+			require.NoError(t, err)
+			assert.Equal(t, tt.caughtUp, caughtUp)
+
+			state, err := st.GetIngestionState(context.Background())
+			require.NoError(t, err)
+			require.NotNil(t, state.LastSuccessfulPoll,
+				"a successful poll must record last_successful_poll")
+			assert.True(t, state.LastSuccessfulPoll.After(before),
+				"poll timestamp should be stamped during this cycle, not stale")
+			assert.True(t, state.LastSuccessfulPoll.Before(after),
+				"poll timestamp should be a real recent time")
+		})
+	}
 }
 
 func TestPagination_FullPageKeepsCursorAndContinues(t *testing.T) {
@@ -475,6 +579,63 @@ func TestPagination_ErrorMidChainAborts(t *testing.T) {
 	assert.Contains(t, err.Error(), "boom")
 }
 
+// TestReingestRange_ToleratesShortPages covers reingestBatch pagination
+// over a closed ledger range. Stopping on a short-but-cursored page would
+// be worse than slow here: ReplaceEventsInRange deletes every stored row
+// in [from, to] that the re-fetch didn't return, so an early stop deletes
+// events that were never replaced.
+func TestReingestRange_ToleratesShortPages(t *testing.T) {
+	tests := []struct {
+		name       string
+		pages      map[string]rpc.GetEventsResponse
+		wantCalls  int
+		wantEvents []string
+	}{
+		{
+			name: "short page without cursor ends the range",
+			pages: map[string]rpc.GetEventsResponse{
+				"": {Events: []rpc.Event{rpcEvent("e1", 100)}, LatestLedger: 500},
+			},
+			wantCalls:  1,
+			wantEvents: []string{"e1"},
+		},
+		{
+			name: "short page with cursor keeps paging",
+			pages: map[string]rpc.GetEventsResponse{
+				"":   {Events: []rpc.Event{rpcEvent("e1", 100)}, LatestLedger: 500, Cursor: "c1"},
+				"c1": {Events: []rpc.Event{rpcEvent("e2", 150)}, LatestLedger: 500},
+			},
+			wantCalls:  2,
+			wantEvents: []string{"e1", "e2"},
+		},
+		{
+			name: "non-advancing cursor stops instead of spinning",
+			pages: map[string]rpc.GetEventsResponse{
+				"":   {Events: []rpc.Event{rpcEvent("e1", 100)}, LatestLedger: 500, Cursor: "c1"},
+				"c1": {Events: []rpc.Event{rpcEvent("e2", 150)}, LatestLedger: 500, Cursor: "c1"},
+			},
+			wantCalls:  2,
+			wantEvents: []string{"e1", "e2"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := newScriptedRPC(tt.pages)
+			st := newMockStore()
+			ing := newTestIngester(client, st, Options{PageLimit: 10})
+
+			n, err := ing.ReingestRange(context.Background(), nil, 100, 200)
+			require.NoError(t, err)
+			assert.Len(t, tt.wantEvents, n)
+			require.Len(t, client.calls, tt.wantCalls)
+			for _, id := range tt.wantEvents {
+				assert.Contains(t, st.events, id)
+			}
+		})
+	}
+}
+
 // paginationCursor extracts the cursor from a GetEvents request, or
 // returns "" when pagination is unset (cold start or first call).
 func paginationCursor(req rpc.GetEventsRequest) string {
@@ -482,6 +643,186 @@ func paginationCursor(req rpc.GetEventsRequest) string {
 		return ""
 	}
 	return req.Pagination.Cursor
+}
+
+// TestWindowSweep_ToleratesShortPages covers the sweepBatch pagination
+// contract: a page shorter than the requested limit only terminates the
+// batch when it carries NO top-level cursor. An RPC that returns fewer
+// results than requested while more data remains (internal caps,
+// filtering, load shedding) must be paged to completion — stopping early
+// would let windowSweep advance the frontier past unfetched events and
+// lose them permanently.
+func TestWindowSweep_ToleratesShortPages(t *testing.T) {
+	// Chain head 200 bounds every window at [start, 200], so any event
+	// at ledger ≤ 200 is inside the swept range and must be fetched.
+	const latest = uint32(200)
+
+	tests := []struct {
+		name string
+		// pages maps the inbound request cursor to the response, mirroring
+		// how the ingester threads cursors between pages.
+		pages map[string]rpc.GetEventsResponse
+		// wantCalls is the exact number of GetEvents requests the sweep
+		// may issue; a larger number means the loop spun (or stopped
+		// early when too small).
+		wantCalls int
+		// wantEvents is the set of event IDs that must land in the store.
+		wantEvents []string
+	}{
+		{
+			name: "short page without cursor ends the batch",
+			pages: map[string]rpc.GetEventsResponse{
+				"": {Events: []rpc.Event{rpcEvent("e1", 100)}, LatestLedger: latest},
+			},
+			wantCalls:  1,
+			wantEvents: []string{"e1"},
+		},
+		{
+			name: "short page with cursor keeps paging",
+			pages: map[string]rpc.GetEventsResponse{
+				"":   {Events: []rpc.Event{rpcEvent("e1", 100)}, LatestLedger: latest, Cursor: "c1"},
+				"c1": {Events: []rpc.Event{rpcEvent("e2", 150)}, LatestLedger: latest},
+			},
+			wantCalls:  2,
+			wantEvents: []string{"e1", "e2"},
+		},
+		{
+			name: "several consecutive short pages drain fully",
+			pages: map[string]rpc.GetEventsResponse{
+				"":   {Events: []rpc.Event{rpcEvent("e1", 100)}, LatestLedger: latest, Cursor: "c1"},
+				"c1": {Events: []rpc.Event{rpcEvent("e2", 120)}, LatestLedger: latest, Cursor: "c2"},
+				"c2": {Events: []rpc.Event{rpcEvent("e3", 140)}, LatestLedger: latest},
+			},
+			wantCalls:  3,
+			wantEvents: []string{"e1", "e2", "e3"},
+		},
+		{
+			name: "non-advancing cursor stops instead of spinning",
+			pages: map[string]rpc.GetEventsResponse{
+				"":   {Events: []rpc.Event{rpcEvent("e1", 100)}, LatestLedger: latest, Cursor: "c1"},
+				"c1": {Events: []rpc.Event{rpcEvent("e2", 150)}, LatestLedger: latest, Cursor: "c1"},
+			},
+			wantCalls:  2,
+			wantEvents: []string{"e1", "e2"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := newScriptedRPC(tt.pages)
+			client.health = rpc.Health{Status: "healthy", LatestLedger: latest, OldestLedger: 10}
+			st := newMockStore()
+			ing := newTestIngester(client, st, Options{StartLedger: 100, PageLimit: 10})
+
+			caughtUp, err := ing.windowSweep(context.Background(), 100,
+				[][]rpc.EventFilter{{{Type: "contract"}}})
+			require.NoError(t, err)
+			assert.True(t, caughtUp, "window reaches the chain head")
+
+			require.Len(t, client.calls, tt.wantCalls)
+			for _, id := range tt.wantEvents {
+				assert.Contains(t, st.events, id)
+			}
+
+			// Whatever the paging shape, a completed window must advance
+			// the frontier to the window end and never persist an internal
+			// batch cursor as global state.
+			state, err := st.GetIngestionState(context.Background())
+			require.NoError(t, err)
+			assert.Equal(t, int64(latest)-1, state.LastIngestedLedger)
+			assert.Empty(t, state.LastCursor)
+		})
+	}
+}
+
+// TestWindowSweep_ShortPageWithoutCursorDoesNotAdvanceFrontier pins the
+// failure mode this tolerance exists to prevent: had the short-but-
+// cursored page been treated as terminal, e2 would never have been fetched
+// while the frontier still moved past it.
+func TestWindowSweep_ShortPageWithoutCursorDoesNotAdvanceFrontier(t *testing.T) {
+	client := newScriptedRPC(map[string]rpc.GetEventsResponse{
+		"":   {Events: []rpc.Event{rpcEvent("e1", 100)}, LatestLedger: 500, Cursor: "c1"},
+		"c1": {Events: []rpc.Event{rpcEvent("e2", 400)}, LatestLedger: 500},
+	})
+	client.health = rpc.Health{Status: "healthy", LatestLedger: 500, OldestLedger: 10}
+	st := newMockStore()
+	ing := newTestIngester(client, st, Options{StartLedger: 100, PageLimit: 100})
+
+	_, err := ing.windowSweep(context.Background(), 100,
+		[][]rpc.EventFilter{{{Type: "contract"}}})
+	require.NoError(t, err)
+
+	assert.Contains(t, st.events, "e2",
+		"the event behind the short page's cursor must be ingested")
+}
+
+// TestNextState_PageShapes documents the singlePage/nextState contract for
+// every page shape the RPC can return. Unlike the sweep paths, a short
+// page there is safe to call "caught up": the cursor (top-level or the
+// per-event fallback) is persisted either way, so the next cycle resumes
+// from exactly where the page ended.
+func TestNextState_PageShapes(t *testing.T) {
+	tests := []struct {
+		name         string
+		resp         rpc.GetEventsResponse
+		limit        uint
+		wantCaughtUp bool
+		wantCursor   string
+		wantLedger   int64
+	}{
+		{
+			name: "full page is not caught up",
+			resp: rpc.GetEventsResponse{
+				Events:       []rpc.Event{rpcEvent("e1", 100), rpcEvent("e2", 101)},
+				LatestLedger: 500,
+				Cursor:       "c-e2",
+			},
+			limit:        2,
+			wantCaughtUp: false,
+			wantCursor:   "c-e2",
+			wantLedger:   101,
+		},
+		{
+			name: "short page with cursor is resumable",
+			resp: rpc.GetEventsResponse{
+				Events:       []rpc.Event{rpcEvent("e1", 100)},
+				LatestLedger: 500,
+				Cursor:       "c-e1",
+			},
+			limit:        100,
+			wantCaughtUp: true,
+			wantCursor:   "c-e1",
+			wantLedger:   100,
+		},
+		{
+			name: "short page without cursor falls back to the per-event token",
+			resp: rpc.GetEventsResponse{
+				Events:       []rpc.Event{rpcEvent("e1", 100)},
+				LatestLedger: 500,
+			},
+			limit:        100,
+			wantCaughtUp: true,
+			wantCursor:   "e1",
+			wantLedger:   100,
+		},
+		{
+			name:         "empty page parks the frontier below the chain head",
+			resp:         rpc.GetEventsResponse{LatestLedger: 500},
+			limit:        100,
+			wantCaughtUp: true,
+			wantCursor:   "",
+			wantLedger:   499,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			state, caughtUp := nextState(tt.resp, tt.limit)
+			assert.Equal(t, tt.wantCaughtUp, caughtUp)
+			assert.Equal(t, tt.wantCursor, state.LastCursor)
+			assert.Equal(t, tt.wantLedger, state.LastIngestedLedger)
+		})
+	}
 }
 
 func TestPagination_LegacyPagingTokenFallback(t *testing.T) {
@@ -664,6 +1005,102 @@ func TestPersistEvents_RetainsRawXDR(t *testing.T) {
 	assert.Equal(t, "value-xdr", st.events["e1"].RawValueXDR)
 	assert.Empty(t, st.events["e2"].RawTopicXDR)
 	assert.Empty(t, st.events["e2"].RawValueXDR)
+}
+
+func TestSkipContracts(t *testing.T) {
+	skippedID := "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	keptID := "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+	ev1 := rpc.Event{
+		ID:         "e1",
+		Type:       "contract",
+		Ledger:     100,
+		ContractID: skippedID,
+	}
+	ev2 := rpc.Event{
+		ID:         "e2",
+		Type:       "contract",
+		Ledger:     100,
+		ContractID: keptID,
+	}
+
+	client := &mockRPC{eventsResps: []rpc.GetEventsResponse{{
+		Events:       []rpc.Event{ev1, ev2},
+		LatestLedger: 500,
+	}}}
+	st := newMockStore()
+	ing := newTestIngester(client, st, Options{
+		StartLedger:   100,
+		SkipContracts: []string{skippedID},
+	})
+
+	_, err := ing.runOnce(context.Background())
+	require.NoError(t, err)
+
+	_, hasEv1 := st.events["e1"]
+	_, hasEv2 := st.events["e2"]
+	assert.False(t, hasEv1, "event from skipped contract should not be persisted")
+	assert.True(t, hasEv2, "event from non-skipped contract should be persisted")
+}
+
+func TestPersistEvents_DeduplicatesEventIDs(t *testing.T) {
+	tests := []struct {
+		name         string
+		rpcEvents    []rpc.Event
+		wantEventIDs []string
+	}{
+		{
+			name: "no duplicates, all events pass through",
+			rpcEvents: []rpc.Event{
+				rpcEvent("e1", 100),
+				rpcEvent("e2", 101),
+				rpcEvent("e3", 102),
+			},
+			wantEventIDs: []string{"e1", "e2", "e3"},
+		},
+		{
+			name: "duplicate ID removed, first occurrence kept",
+			rpcEvents: []rpc.Event{
+				rpcEvent("e1", 100),
+				rpcEvent("e2", 101),
+				rpcEvent("e1", 102), // duplicate of e1
+			},
+			wantEventIDs: []string{"e1", "e2"},
+		},
+		{
+			name: "multiple duplicate IDs, only first of each kept",
+			rpcEvents: []rpc.Event{
+				rpcEvent("e1", 100),
+				rpcEvent("e2", 101),
+				rpcEvent("e1", 102), // duplicate of e1
+				rpcEvent("e2", 103), // duplicate of e2
+				rpcEvent("e3", 104),
+			},
+			wantEventIDs: []string{"e1", "e2", "e3"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &mockRPC{eventsResps: []rpc.GetEventsResponse{{
+				Events:       tt.rpcEvents,
+				LatestLedger: 500,
+			}}}
+			st := newMockStore()
+			ing := newTestIngester(client, st, Options{StartLedger: 100})
+
+			_, err := ing.runOnce(context.Background())
+			require.NoError(t, err)
+
+			// Check that only the expected event IDs were persisted (no duplicates)
+			var persistedIDs []string
+			for id := range st.events {
+				persistedIDs = append(persistedIDs, id)
+			}
+			sort.Strings(persistedIDs)
+			sort.Strings(tt.wantEventIDs)
+			assert.Equal(t, tt.wantEventIDs, persistedIDs,
+				"event IDs after deduplication should match expected set")
+		})
+	}
 }
 
 func TestFilterBatching(t *testing.T) {
@@ -1091,7 +1528,7 @@ func TestWindowSweep_ParallelBatchesReclampsOnOOR(t *testing.T) {
 		},
 	}
 	ing := newTestIngester(client, st, Options{
-		StartLedger:      100,
+		StartLedger:      40_000,
 		SweepWindow:      1_000,
 		PageLimit:        100,
 		SweepConcurrency: 4,
@@ -1606,6 +2043,55 @@ func TestIngester_LogAttrsEffectiveConfig(t *testing.T) {
 	}
 }
 
+func TestIngester_BackoffSleepBounds(t *testing.T) {
+	tests := []struct {
+		name    string
+		opts    Options
+		backoff time.Duration
+		jitter  time.Duration
+		want    time.Duration
+	}{
+		{
+			name:    "legacy proportional jitter",
+			opts:    Options{Jitter: func(time.Duration) time.Duration { return 0 }},
+			backoff: time.Second,
+			want:    500 * time.Millisecond,
+		},
+		{
+			name: "configured jitter bounds",
+			opts: Options{
+				JitterMin: 100 * time.Millisecond,
+				JitterMax: 300 * time.Millisecond,
+				Jitter: func(max time.Duration) time.Duration {
+					return max - time.Nanosecond
+				},
+			},
+			backoff: time.Second,
+			want:    799*time.Millisecond + 999999*time.Nanosecond,
+		},
+		{
+			name: "equal jitter bounds are fixed",
+			opts: Options{
+				JitterMin: 250 * time.Millisecond,
+				JitterMax: 250 * time.Millisecond,
+				Jitter: func(time.Duration) time.Duration {
+					return time.Hour
+				},
+			},
+			backoff: time.Second,
+			want:    750 * time.Millisecond,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.opts.applyDefaults()
+			ing := &Ingester{opts: tt.opts}
+			got := ing.backoffSleep(tt.backoff)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
 // TestRun_EmitsStartedAndStoppedLogs proves both lifecycle lines fire
 // through the real Run loop: "ingester started" once on entry with the
 // config fields attached, "ingester stopped" once with the exit reason.
@@ -1638,144 +2124,138 @@ func TestRun_EmitsStartedAndStoppedLogs(t *testing.T) {
 	assert.Equal(t, 1, stopped, "exactly one stopped line")
 }
 
-// --- Per-cycle structured summary (fetched / written / skipped) ---
+// stepClock is a test Clock that records every duration passed to
+// SleepCtx and then blocks until the test sends on step (or ctx is
+// canceled), so a test can drive Run's loop one cycle at a time and
+// observe exactly which poll interval each cycle slept for — including a
+// live update applied mid-run via SetPollInterval (issue #148).
+type stepClock struct {
+	mu     sync.Mutex
+	sleeps []time.Duration
+	step   chan struct{}
+}
 
-// cycleSummaries returns the parsed "poll cycle complete" records in order.
-func cycleSummaries(t *testing.T, buf *bytes.Buffer) []map[string]any {
-	t.Helper()
-	var out []map[string]any
-	for _, rec := range logRecords(t, buf, nil) {
-		if rec["msg"] == "poll cycle complete" {
-			out = append(out, rec)
-		}
+func newStepClock() *stepClock {
+	return &stepClock{step: make(chan struct{})}
+}
+
+func (c *stepClock) Now() time.Time { return time.Now() }
+
+func (c *stepClock) SleepCtx(ctx context.Context, d time.Duration) bool {
+	c.mu.Lock()
+	c.sleeps = append(c.sleeps, d)
+	c.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-c.step:
+		return true
 	}
+}
+
+func (c *stepClock) recorded() []time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]time.Duration, len(c.sleeps))
+	copy(out, c.sleeps)
 	return out
 }
 
-// selectiveDecoder fails DecodeScVal for payloads containing failMarker, so a
-// test can force the dead-letter path without XDR fixtures.
-type selectiveDecoder struct{ failMarker string }
+// TestSetPollInterval_RejectsNonPositive covers the validation half of
+// issue #148's acceptance criteria: an invalid reload must be rejected and
+// the previously-applied interval must remain in effect.
+func TestSetPollInterval_RejectsNonPositive(t *testing.T) {
+	ing := newTestIngester(&mockRPC{}, newMockStore(), Options{PollInterval: 5 * time.Second})
+	require.Equal(t, 5*time.Second, ing.PollInterval())
 
-func (d selectiveDecoder) DecodeScVal(xdr string) (json.RawMessage, error) {
-	if strings.Contains(xdr, d.failMarker) {
-		return nil, fmt.Errorf("undecodable %q", xdr)
-	}
-	return json.RawMessage(`"decoded"`), nil
-}
-
-// TestRunOnce_LogsCycleSummary covers the structured per-cycle summary: every
-// cycle emits exactly one line carrying fetched/written/skipped counts.
-func TestRunOnce_LogsCycleSummary(t *testing.T) {
-	xdrEvent := func(id, value string) rpc.Event {
-		return rpc.Event{
-			ID:         id,
-			Type:       "contract",
-			Ledger:     100,
-			ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-			Value:      value,
-		}
-	}
-
-	tests := []struct {
-		name        string
-		decoder     decode.Decoder
-		resp        rpc.GetEventsResponse
-		watch       int
-		pageLimit   uint
-		wantFetched float64
-		wantWritten float64
-		wantSkipped float64
-	}{
-		{
-			name:        "single page with events",
-			decoder:     passthroughDecoder{},
-			resp:        rpc.GetEventsResponse{Events: []rpc.Event{rpcEvent("e1", 100), rpcEvent("e2", 100), rpcEvent("e3", 100)}, LatestLedger: 500},
-			pageLimit:   100,
-			wantFetched: 3, wantWritten: 3, wantSkipped: 0,
-		},
-		{
-			name:        "empty page",
-			decoder:     passthroughDecoder{},
-			resp:        rpc.GetEventsResponse{LatestLedger: 500},
-			pageLimit:   100,
-			wantFetched: 0, wantWritten: 0, wantSkipped: 0,
-		},
-		{
-			name:        "undecodable event is skipped to the dead-letter sink",
-			decoder:     selectiveDecoder{failMarker: "bad"},
-			resp:        rpc.GetEventsResponse{Events: []rpc.Event{xdrEvent("good", "ok-xdr"), xdrEvent("bad", "bad-xdr")}, LatestLedger: 500},
-			pageLimit:   100,
-			wantFetched: 2, wantWritten: 1, wantSkipped: 1,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			log, buf := recordingLogger()
-			client := &mockRPC{eventsResps: []rpc.GetEventsResponse{tt.resp}}
-			st := newMockStore()
-			for i := 0; i < tt.watch; i++ {
-				st.watched = append(st.watched, store.WatchedContract{ContractID: fmt.Sprintf("C%055d", i)})
-			}
-			ing := New(client, st, tt.decoder, log, Options{StartLedger: 100, PageLimit: tt.pageLimit})
-			ing.SetDeadLetterSink(st)
-
-			_, err := ing.runOnce(context.Background())
-			require.NoError(t, err)
-
-			recs := cycleSummaries(t, buf)
-			require.Len(t, recs, 1, "exactly one summary line per cycle")
-			assert.Equal(t, tt.wantFetched, recs[0]["fetched"])
-			assert.Equal(t, tt.wantWritten, recs[0]["written"])
-			assert.Equal(t, tt.wantSkipped, recs[0]["skipped"])
-		})
+	for _, d := range []time.Duration{0, -1, -time.Second} {
+		err := ing.SetPollInterval(d)
+		assert.Errorf(t, err, "SetPollInterval(%s) should be rejected", d)
+		assert.Equal(t, 5*time.Second, ing.PollInterval(),
+			"a rejected SetPollInterval must leave the current interval unchanged")
 	}
 }
 
-// TestRunOnce_LogsOneCycleSummaryForWindowSweep proves the multi-batch window
-// sweep still emits a single aggregated summary line rather than one per batch.
-func TestRunOnce_LogsOneCycleSummaryForWindowSweep(t *testing.T) {
-	log, buf := recordingLogger()
-	st := newMockStore()
-	for i := 0; i < 27; i++ { // >25 contracts forces multiple filter batches
-		st.watched = append(st.watched, store.WatchedContract{ContractID: fmt.Sprintf("C%055d", i)})
-	}
-	client := &mockRPC{
-		health: rpc.Health{Status: "healthy", LatestLedger: 5_000, OldestLedger: 10},
-		eventsResps: []rpc.GetEventsResponse{
-			{Events: []rpc.Event{rpcEvent("e1", 150)}, LatestLedger: 5_000},
-			{Events: []rpc.Event{rpcEvent("e2", 180)}, LatestLedger: 5_000},
-		},
-	}
-	ing := New(client, st, passthroughDecoder{}, log, Options{
-		StartLedger: 100, SweepWindow: 1_000, PageLimit: 100,
+// TestSetPollInterval_AcceptsPositive covers the accept path directly: a
+// valid duration updates the live value with no error, independent of
+// Run's sleep loop.
+func TestSetPollInterval_AcceptsPositive(t *testing.T) {
+	ing := newTestIngester(&mockRPC{}, newMockStore(), Options{PollInterval: 5 * time.Second})
+
+	require.NoError(t, ing.SetPollInterval(250*time.Millisecond))
+	assert.Equal(t, 250*time.Millisecond, ing.PollInterval())
+}
+
+// TestSetPollInterval_LiveUpdatesRunLoop drives Run for two caught-up
+// cycles against a stepClock, updating the poll interval live in between,
+// and asserts the second cycle's sleep observed the new value — i.e. a
+// SIGHUP-triggered reload takes effect on the next cycle without a
+// restart, per issue #148's acceptance criteria.
+func TestSetPollInterval_LiveUpdatesRunLoop(t *testing.T) {
+	client := &mockRPC{eventsResps: []rpc.GetEventsResponse{{LatestLedger: 100}}}
+	clock := newStepClock()
+	ing := New(client, newMockStore(), passthroughDecoder{}, testLogger(), Options{
+		StartLedger:  1,
+		PollInterval: 5 * time.Second,
+		Clock:        clock,
 	})
 
-	_, err := ing.runOnce(context.Background())
-	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- ing.Run(ctx) }()
 
-	recs := cycleSummaries(t, buf)
-	require.Len(t, recs, 1, "a 2-batch sweep must still log one cycle summary")
-	assert.Equal(t, float64(2), recs[0]["fetched"])
-	assert.Equal(t, float64(2), recs[0]["written"])
-	assert.Equal(t, float64(0), recs[0]["skipped"])
+	require.Eventually(t, func() bool { return len(clock.recorded()) >= 1 }, 2*time.Second, time.Millisecond)
+	assert.Equal(t, 5*time.Second, clock.recorded()[0], "first cycle sleeps for the constructed interval")
+
+	require.NoError(t, ing.SetPollInterval(50*time.Millisecond))
+	clock.step <- struct{}{} // release cycle 1's sleep so cycle 2 runs
+
+	require.Eventually(t, func() bool { return len(clock.recorded()) >= 2 }, 2*time.Second, time.Millisecond)
+	assert.Equal(t, 50*time.Millisecond, clock.recorded()[1],
+		"second cycle must observe the live-updated interval, no restart required")
+
+	cancel()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return within 2s of cancel")
+	}
 }
 
-// TestRunOnce_CycleSummaryOnError proves a failing cycle still emits its one
-// summary line, tagged with the error, so the summary stream never has holes.
-func TestRunOnce_CycleSummaryOnError(t *testing.T) {
-	log, buf := recordingLogger()
+func TestColdStart_ExplicitStartLedgerRejectedWhenBelowRetention(t *testing.T) {
 	client := &mockRPC{
-		eventsResps: []rpc.GetEventsResponse{{Events: []rpc.Event{rpcEvent("e1", 100)}, LatestLedger: 500}},
-		eventsErrs:  []error{fmt.Errorf("rpc unavailable")},
+		health:      rpc.Health{Status: "healthy", LatestLedger: 50_000, OldestLedger: 40_000},
+		eventsResps: []rpc.GetEventsResponse{{LatestLedger: 50_000}},
 	}
-	st := newMockStore()
-	ing := New(client, st, passthroughDecoder{}, log, Options{StartLedger: 100, PageLimit: 100})
+	ing := newTestIngester(client, newMockStore(), Options{StartLedger: 100})
 
 	_, err := ing.runOnce(context.Background())
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), "below the RPC's oldest retained ledger")
+}
 
-	recs := cycleSummaries(t, buf)
-	require.Len(t, recs, 1)
-	assert.Contains(t, recs[0]["error"], "rpc unavailable")
-	assert.Equal(t, float64(0), recs[0]["fetched"])
+func TestColdStart_RelativeOffsetResolved(t *testing.T) {
+	client := &mockRPC{
+		health:      rpc.Health{Status: "healthy", LatestLedger: 100_000, OldestLedger: 10},
+		eventsResps: []rpc.GetEventsResponse{{LatestLedger: 100_000}},
+	}
+	ing := newTestIngester(client, newMockStore(), Options{StartLedgerRaw: "latest-5000"})
+
+	_, err := ing.runOnce(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, uint32(95_000), client.eventsRequests[0].StartLedger)
+}
+
+func TestColdStart_RelativeOffsetRejectedWhenBelowRetention(t *testing.T) {
+	client := &mockRPC{
+		health:      rpc.Health{Status: "healthy", LatestLedger: 50_000, OldestLedger: 40_000},
+		eventsResps: []rpc.GetEventsResponse{{LatestLedger: 50_000}},
+	}
+	ing := newTestIngester(client, newMockStore(), Options{StartLedgerRaw: "latest-20000"})
+
+	_, err := ing.runOnce(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "below the RPC's oldest retained ledger")
 }

@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
@@ -23,18 +24,84 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/sorotrail/sorotrail/internal/buildinfo"
+	"github.com/sorotrail/sorotrail/internal/decode"
+	"github.com/sorotrail/sorotrail/internal/ingester"
+	"github.com/sorotrail/sorotrail/internal/metrics"
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
+func TestWrapEnvelope(t *testing.T) {
+	tests := []struct {
+		name            string
+		data            any
+		cursor          string
+		wantData        any
+		wantCursor      string
+		wantCursorValue bool
+	}{
+		{
+			name:       "populated slice",
+			data:       []string{"one", "two"},
+			wantData:   []any{"one", "two"},
+			wantCursor: "",
+		},
+		{
+			name:     "nil typed slice",
+			data:     []string(nil),
+			wantData: []any{},
+		},
+		{
+			name:     "empty non-nil slice",
+			data:     []string{},
+			wantData: []any{},
+		},
+		{
+			name:            "non-empty cursor",
+			data:            []string{"one"},
+			cursor:          "next-page",
+			wantData:        []any{"one"},
+			wantCursor:      "next-page",
+			wantCursorValue: true,
+		},
+		{
+			name:     "empty cursor omitted",
+			data:     []string{"one"},
+			wantData: []any{"one"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body, err := json.Marshal(wrapEnvelope(tt.data, tt.cursor))
+			require.NoError(t, err)
+
+			var got map[string]any
+			require.NoError(t, json.Unmarshal(body, &got))
+			assert.Equal(t, tt.wantData, got["data"])
+			if tt.wantCursorValue {
+				assert.Equal(t, tt.wantCursor, got["next_cursor"])
+			} else {
+				assert.NotContains(t, got, "next_cursor")
+			}
+		})
+	}
+}
+
 // stubStore implements store.Store for API tests.
 type stubStore struct {
-	mu         sync.Mutex
-	events     []store.Event
-	eventByID  map[string]store.Event
-	lastFilter store.EventFilter
-	nextCursor string
-	queryErr   error
+	mu        sync.Mutex
+	events    []store.Event
+	eventByID map[string]store.Event
+	// Contract summary/type-count responses for the /contracts/{id}
+	// routes; nil means "return a bare summary for the requested id".
+	contractSummary    *store.ContractSummary
+	contractSummaryErr error
+	eventTypeCounts    []store.ContractEventTypeCount
+	eventTypeCountsErr error
+	lastFilter         store.EventFilter
+	nextCursor         string
+	queryErr           error
 
 	totalCount      int64
 	countEventsErr  error
@@ -54,6 +121,7 @@ type stubStore struct {
 	lastExcludeID string
 
 	stats            store.Stats
+	statsCalls       int // number of Stats calls (to observe caching)
 	pingErr          error
 	watchedList      []store.WatchedContract
 	watchedListErr   error
@@ -79,6 +147,7 @@ type stubStore struct {
 	listContractsErr     error
 	countContractsResult int64
 	countContractsErr    error
+	lastContractsFilter  store.ContractsFilter
 
 	addressEvents    []store.Event
 	addressCursor    string
@@ -89,6 +158,17 @@ type stubStore struct {
 	deadLettersResult []store.DeadLetter
 	deadLettersCursor string
 	deadLettersErr    error
+	// deadLettersCount is what CountDeadLetters returns; the error field
+	// drives the "count failed, header omitted" path.
+	deadLettersCount    int64
+	deadLettersCountErr error
+
+	// deliveryAttemptsCount is what CountDeliveryAttempts returns; the
+	// error field drives the "count failed, header omitted" path.
+	deliveryAttemptsCount    int64
+	deliveryAttemptsCountErr error
+
+	subscriptions []store.Subscription
 
 	contractCursors map[string]store.ContractCursor
 }
@@ -221,8 +301,13 @@ func (s *stubStore) MigrationVersion(context.Context) (int, bool, error) {
 	return v, s.migrationDirty, nil
 }
 
-func (s *stubStore) Stats(context.Context, store.Scope) (store.Stats, error) { return s.stats, nil }
-func (s *stubStore) Ping(context.Context) error                              { return s.pingErr }
+func (s *stubStore) Stats(_ context.Context, _ store.Scope) (store.Stats, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.statsCalls++
+	return s.stats, nil
+}
+func (s *stubStore) Ping(context.Context) error { return s.pingErr }
 func (s *stubStore) ListWatchedContracts(context.Context) ([]store.WatchedContract, error) {
 	return s.watchedList, s.watchedListErr
 }
@@ -237,20 +322,15 @@ func (s *stubStore) RemoveWatchedContract(_ context.Context, id string) error {
 	return s.removeErr
 }
 
-func (s *stubStore) ListContracts(ctx context.Context, f store.ContractsFilter) ([]store.ContractSummary, string, error) {
+func (s *stubStore) ListContracts(_ context.Context, f store.ContractsFilter) ([]store.ContractSummary, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastContractsFilter = f
 	return s.listContractsResult, s.listContractsCursor, s.listContractsErr
 }
 
-func (s *stubStore) CountContracts(ctx context.Context, f store.ContractsFilter) (int64, error) {
+func (s *stubStore) CountContracts(context.Context, store.ContractsFilter) (int64, error) {
 	return s.countContractsResult, s.countContractsErr
-}
-
-func (s *stubStore) GetContractSummary(context.Context, string) (store.ContractSummary, error) {
-	return store.ContractSummary{}, store.ErrNotFound
-}
-
-func (s *stubStore) ContractEventTypeCounts(context.Context, string) ([]store.ContractEventTypeCount, error) {
-	return nil, nil
 }
 
 // Subscription stubs for the webhook feature.
@@ -262,12 +342,21 @@ func (s *stubStore) GetSubscription(_ context.Context, id int64, _ store.Subscri
 	return store.Subscription{}, store.ErrNotFound
 }
 func (s *stubStore) ListSubscriptions(context.Context, store.SubscriptionOwner) ([]store.Subscription, error) {
-	return nil, nil
+	return s.subscriptions, nil
 }
 func (s *stubStore) UpdateSubscription(_ context.Context, sub store.Subscription, _ store.SubscriptionOwner) (store.Subscription, error) {
 	return sub, nil
 }
 func (s *stubStore) DeleteSubscription(context.Context, int64, store.SubscriptionOwner) error {
+	return nil
+}
+func (s *stubStore) GetContractSpecOverride(context.Context, string) ([]byte, error) {
+	return nil, nil
+}
+func (s *stubStore) SetContractSpecOverride(context.Context, string, []byte) error {
+	return nil
+}
+func (s *stubStore) DeleteContractSpecOverride(context.Context, string) error {
 	return nil
 }
 func (s *stubStore) ListEnabledSubscriptions(context.Context) ([]store.Subscription, error) {
@@ -304,6 +393,22 @@ func (s *stubStore) UpsertEvents(context.Context, []store.Event) (int64, error) 
 	return 0, nil
 }
 
+func (s *stubStore) CreateAPIKey(context.Context, store.APIKey) (store.APIKey, error) {
+	return store.APIKey{}, nil
+}
+func (s *stubStore) GetAPIKey(context.Context, int64) (store.APIKey, error) {
+	return store.APIKey{}, nil
+}
+func (s *stubStore) LookupAPIKeyByPrefix(context.Context, string) (store.APIKey, error) {
+	return store.APIKey{}, nil
+}
+func (s *stubStore) ListAPIKeys(context.Context) ([]store.APIKey, error) {
+	return nil, nil
+}
+func (s *stubStore) RevokeAPIKey(context.Context, int64) error {
+	return nil
+}
+
 func (s *stubStore) GetContractCursor(_ context.Context, contractID string) (store.ContractCursor, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -333,6 +438,20 @@ func (s *stubStore) UpsertContractMeta(context.Context, store.ContractMeta) erro
 }
 func (s *stubStore) CountContractEvents(context.Context, string) (int64, error) {
 	return 0, nil
+}
+
+func (s *stubStore) GetContractSummary(_ context.Context, id string) (store.ContractSummary, error) {
+	if s.contractSummaryErr != nil {
+		return store.ContractSummary{}, s.contractSummaryErr
+	}
+	if s.contractSummary != nil {
+		return *s.contractSummary, nil
+	}
+	return store.ContractSummary{ContractID: id}, nil
+}
+
+func (s *stubStore) ContractEventTypeCounts(context.Context, string) ([]store.ContractEventTypeCount, error) {
+	return s.eventTypeCounts, s.eventTypeCountsErr
 }
 func (s *stubStore) ListContractsNeedingRefresh(context.Context, time.Time) ([]string, error) {
 	return nil, nil
@@ -527,6 +646,10 @@ func TestListEvents_BadParams(t *testing.T) {
 		"/events?cursor=e1%3BDROP",
 		"/events?cursor=%3Cscript%3E",
 		"/events?cursor=cursor%27OR%271%3D%271",
+		"/events?topic={\"symbol\":\"transfer\"",
+		"/events?topic=[1,2",
+		"/events?from_ledger=0",
+		"/events?to_ledger=0",
 		"/events?topic_contains=not-valid-json",
 		"/events?has_value=maybe",
 	} {
@@ -758,6 +881,95 @@ func TestListContracts(t *testing.T) {
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 		assert.Equal(t, "no-cache", resp.Header.Get("Cache-Control"))
 	})
+
+	// Issue #5 pins down the pagination contract: ordered by contract_id
+	// with the same cursor style as /events — opaque cursor in, opaque
+	// next-page cursor out (omitted on the last page), limit 1–200 with a
+	// default of 50.
+	t.Run("defaults to contract_id ordering and limit 50", func(t *testing.T) {
+		st := &stubStore{
+			listContractsResult: []store.ContractSummary{},
+		}
+		s := newTestServer(st, nil)
+		resp, _ := doGet(t, s, "/contracts")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Empty(t, st.lastContractsFilter.SortKey)
+		assert.Empty(t, st.lastContractsFilter.Order)
+		assert.Equal(t, store.DefaultQueryLimit, st.lastContractsFilter.Limit)
+	})
+
+	t.Run("forwards the opaque cursor and surfaces the next one", func(t *testing.T) {
+		st := &stubStore{
+			listContractsResult: []store.ContractSummary{
+				{ContractID: testContract, EventCount: 1, FirstLedger: 1, LastLedger: 2},
+			},
+			listContractsCursor: "MTAwfENBQUFB",
+		}
+		s := newTestServer(st, nil)
+		resp, body := doGet(t, s, "/contracts?cursor=MTAwfENBQUFB")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		assert.Equal(t, "MTAwfENBQUFB", st.lastContractsFilter.Cursor)
+
+		var out contractListResponse
+		require.NoError(t, json.Unmarshal(body, &out))
+		assert.Equal(t, "MTAwfENBQUFB", out.Cursor)
+	})
+
+	t.Run("omits cursor on the last page", func(t *testing.T) {
+		st := &stubStore{
+			listContractsResult: []store.ContractSummary{
+				{ContractID: testContract, EventCount: 1, FirstLedger: 1, LastLedger: 2},
+			},
+		}
+		s := newTestServer(st, nil)
+		resp, body := doGet(t, s, "/contracts")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.NotContains(t, string(body), `"cursor"`)
+	})
+
+	t.Run("accepts limit up to 200", func(t *testing.T) {
+		st := &stubStore{listContractsResult: []store.ContractSummary{}}
+		s := newTestServer(st, nil)
+		resp, _ := doGet(t, s, "/contracts?limit=200")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, 200, st.lastContractsFilter.Limit)
+	})
+
+	t.Run("rejects limit outside [1,200]", func(t *testing.T) {
+		st := &stubStore{listContractsResult: []store.ContractSummary{}}
+		s := newTestServer(st, nil)
+		for _, bad := range []string{"0", "-5", "201", "500", "xyz"} {
+			resp, body := doGet(t, s, "/contracts?limit="+bad)
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "limit=%q", bad)
+			var errResp map[string]string
+			require.NoError(t, json.Unmarshal(body, &errResp))
+			assert.Contains(t, errResp["error"], "limit must be an integer in [1,200]")
+		}
+	})
+
+	t.Run("rejects unknown sort and order values", func(t *testing.T) {
+		st := &stubStore{listContractsResult: []store.ContractSummary{}}
+		s := newTestServer(st, nil)
+		resp, _ := doGet(t, s, "/contracts?sort=bogus")
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		resp, _ = doGet(t, s, "/contracts?order=sideways")
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		assert.Empty(t, st.lastContractsFilter.SortKey) // store never consulted
+	})
+
+	t.Run("malformed cursor is a 400, not a 500", func(t *testing.T) {
+		// The charset pre-check lets well-formed-but-undecodable strings
+		// through; the store rejects them with ErrInvalidContractsCursor,
+		// which the handler must map to 400 (client input), not 500.
+		st := &stubStore{listContractsErr: store.ErrInvalidContractsCursor}
+		s := newTestServer(st, nil)
+		resp, body := doGet(t, s, "/contracts?cursor=notarealcursor")
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		var errResp map[string]string
+		require.NoError(t, json.Unmarshal(body, &errResp))
+		assert.Contains(t, errResp["error"], "invalid cursor")
+	})
 }
 
 func TestListEvents_CursorAndLimitValidation(t *testing.T) {
@@ -843,6 +1055,110 @@ func TestContractEvents_EmitsPaginationLinks(t *testing.T) {
 	assert.Contains(t, linkHeader, `/contracts/`+testContract+`/events`)
 	assert.Contains(t, linkHeader, `limit=2`)
 	assert.NotContains(t, linkHeader, `cursor=prev-cursor`)
+}
+
+// TestPaginatedListEndpoints_EmitsPaginationLinks covers the RFC 5988
+// Link header on the remaining cursor-paginated list endpoints: contracts,
+// dead letters, and address events. Each must advertise rel="next" when a
+// continuation cursor exists, rel="prev" when the caller supplied a
+// cursor, and preserve every other query parameter in the links.
+func TestPaginatedListEndpoints_EmitsPaginationLinks(t *testing.T) {
+	t.Run("contracts emits next and preserves filters", func(t *testing.T) {
+		st := &stubStore{
+			listContractsResult: []store.ContractSummary{
+				{ContractID: testContract, EventCount: 10},
+			},
+			listContractsCursor: "c1",
+		}
+		resp, _ := doGet(t, newTestServer(st, nil), "/contracts?limit=2&sort=count")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		linkHeader := resp.Header.Get("Link")
+		assert.Contains(t, linkHeader, `rel="next"`)
+		assert.Contains(t, linkHeader, `cursor=c1`)
+		assert.Contains(t, linkHeader, `limit=2`)
+		assert.Contains(t, linkHeader, `sort=count`)
+		assert.NotContains(t, linkHeader, `rel="prev"`,
+			"no caller cursor was supplied, so no prev link")
+	})
+
+	t.Run("contracts emits prev when the caller supplied a cursor", func(t *testing.T) {
+		st := &stubStore{
+			listContractsResult: []store.ContractSummary{
+				{ContractID: testContract, EventCount: 10},
+			},
+			listContractsCursor: "c2",
+		}
+		resp, _ := doGet(t, newTestServer(st, nil), "/contracts?cursor=prev-c&limit=2")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		linkHeader := resp.Header.Get("Link")
+		assert.Contains(t, linkHeader, `rel="prev"`)
+		assert.Contains(t, linkHeader, `rel="next"`)
+		assert.NotContains(t, linkHeader, `cursor=prev-c`)
+	})
+
+	t.Run("dead-letters emits next and preserves filters", func(t *testing.T) {
+		st := &stubStore{
+			deadLettersResult: []store.DeadLetter{{ID: 1}},
+			deadLettersCursor: "dl-c1",
+		}
+		resp, _ := doGetWithAuth(t, newTestServer(st, nil),
+			"/dead-letters?contract_id="+testContract+"&limit=2", "test-key")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		linkHeader := resp.Header.Get("Link")
+		assert.Contains(t, linkHeader, `rel="next"`)
+		assert.Contains(t, linkHeader, `cursor=dl-c1`)
+		assert.Contains(t, linkHeader, `contract_id=`+testContract)
+		assert.Contains(t, linkHeader, `limit=2`)
+	})
+
+	t.Run("dead-letters emits prev when the caller supplied a cursor", func(t *testing.T) {
+		st := &stubStore{
+			deadLettersResult: []store.DeadLetter{{ID: 1}},
+			deadLettersCursor: "dl-c2",
+		}
+		resp, _ := doGetWithAuth(t, newTestServer(st, nil),
+			"/dead-letters?cursor=dl-prev&limit=2", "test-key")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		linkHeader := resp.Header.Get("Link")
+		assert.Contains(t, linkHeader, `rel="prev"`)
+		assert.Contains(t, linkHeader, `rel="next"`)
+		assert.NotContains(t, linkHeader, `cursor=dl-prev`)
+	})
+
+	t.Run("address events emits next and preserves filters", func(t *testing.T) {
+		st := &stubStore{
+			addressEvents: []store.Event{{ID: "e1"}},
+			addressCursor: "a-c1",
+		}
+		resp, _ := doGet(t, newTestServer(st, nil),
+			"/addresses/"+testAddress+"/events?from_ledger=100&limit=2")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		linkHeader := resp.Header.Get("Link")
+		assert.Contains(t, linkHeader, `rel="next"`)
+		assert.Contains(t, linkHeader, `cursor=a-c1`)
+		assert.Contains(t, linkHeader, `from_ledger=100`)
+		assert.Contains(t, linkHeader, `limit=2`)
+	})
+
+	t.Run("address events emits prev when the caller supplied a cursor", func(t *testing.T) {
+		st := &stubStore{
+			addressEvents: []store.Event{{ID: "e1"}},
+			addressCursor: "a-c2",
+		}
+		resp, _ := doGet(t, newTestServer(st, nil),
+			"/addresses/"+testAddress+"/events?cursor=a-prev&limit=2")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		linkHeader := resp.Header.Get("Link")
+		assert.Contains(t, linkHeader, `rel="prev"`)
+		assert.Contains(t, linkHeader, `rel="next"`)
+		assert.NotContains(t, linkHeader, `cursor=a-prev`)
+	})
 }
 
 func TestListEvents_IncludeXDR(t *testing.T) {
@@ -1112,8 +1428,13 @@ func TestLivez(t *testing.T) {
 
 func TestReadyz(t *testing.T) {
 	t.Run("all healthy", func(t *testing.T) {
-		resp, _ := doGet(t, newTestServer(&stubStore{}, nil), "/readyz")
+		resp, body := doGet(t, newTestServer(&stubStore{}, nil), "/readyz")
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		var h healthResponse
+		require.NoError(t, json.Unmarshal(body, &h))
+		assert.Equal(t, "ok", h.Status)
+		assert.Equal(t, "ok", h.Checks["database"])
+		assert.Equal(t, "ok", h.Checks["rpc"])
 	})
 
 	t.Run("db down returns 503 with reason", func(t *testing.T) {
@@ -1234,6 +1555,40 @@ func TestStats(t *testing.T) {
 		assert.Equal(t, uint64(0), got.QueryErrors, "query_errors should be present and zero")
 	})
 
+	t.Run("surfaces the ingester's last-successful-poll timestamp", func(t *testing.T) {
+		poll := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+		st := &stubStore{
+			stats: store.Stats{TotalEvents: 42, LastIngestedLedger: 999},
+			ingestionState: &store.IngestionState{
+				LastIngestedLedger: 999,
+				LastSuccessfulPoll: &poll,
+			},
+		}
+		resp, body := doGet(t, newTestServer(st, nil), "/stats")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var got store.Stats
+		require.NoError(t, json.Unmarshal(body, &got))
+		require.NotNil(t, got.LastSuccessfulPoll)
+		assert.Equal(t, poll, *got.LastSuccessfulPoll)
+
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal(body, &raw))
+		assert.Contains(t, raw, "last_successful_poll")
+	})
+
+	t.Run("omits last-successful-poll when the ingester has never polled", func(t *testing.T) {
+		st := &stubStore{stats: store.Stats{TotalEvents: 42, LastIngestedLedger: 999}}
+		resp, body := doGet(t, newTestServer(st, nil), "/stats")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var got store.Stats
+		require.NoError(t, json.Unmarshal(body, &got))
+		assert.Nil(t, got.LastSuccessfulPoll)
+
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal(body, &raw))
+		assert.NotContains(t, raw, "last_successful_poll")
+	})
+
 	t.Run("keeps stored stats when RPC is down", func(t *testing.T) {
 		st := &stubStore{stats: store.Stats{
 			TotalEvents:        42,
@@ -1258,6 +1613,124 @@ func TestStats(t *testing.T) {
 		assert.Contains(t, raw, "ingest_lag_ledgers")
 		assert.Nil(t, raw["ingest_lag_ledgers"])
 		assert.Equal(t, uint64(0), got.QueryErrors, "query_errors should be present and zero")
+	})
+}
+
+// TestStats_IngesterEffectivePollInterval covers issue #146's acceptance
+// criterion "expose the current effective interval in /stats": once an
+// Ingester is registered via SetIngester, /stats must surface its live
+// adaptive poll interval, and must omit it (zero value) when none is
+// registered.
+func TestStats_IngesterEffectivePollInterval(t *testing.T) {
+	t.Cleanup(func() { SetIngester(nil) })
+
+	st := &stubStore{}
+	rc := &stubRPC{health: rpc.Health{Status: "healthy"}}
+
+	t.Run("absent when no ingester registered", func(t *testing.T) {
+		SetIngester(nil)
+		resp, body := doGet(t, newTestServer(st, rc), "/stats")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var got store.Stats
+		require.NoError(t, json.Unmarshal(body, &got))
+		assert.Zero(t, got.Ingester.EffectivePollIntervalMs)
+	})
+
+	t.Run("reflects the registered ingester's live interval", func(t *testing.T) {
+		ing := ingester.New(nil, nil, decode.XDRDecoder{}, slog.New(slog.NewTextHandler(io.Discard, nil)), ingester.Options{
+			PollInterval:    5 * time.Second,
+			PollIntervalMin: time.Second,
+			PollIntervalMax: 30 * time.Second,
+		})
+		SetIngester(ing)
+
+		resp, body := doGet(t, newTestServer(st, rc), "/stats")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var got store.Stats
+		require.NoError(t, json.Unmarshal(body, &got))
+		assert.Equal(t, int64(5000), got.Ingester.EffectivePollIntervalMs)
+	})
+}
+
+// TestStats_EventsIngestedTotal covers issue #536: /stats must surface the
+// cumulative count of events the ingester has persisted, read from the
+// Prometheus counter metrics.EventsIngested, rather than permanently
+// reporting zero.
+func TestStats_EventsIngestedTotal(t *testing.T) {
+	before := testutil.ToFloat64(metrics.EventsIngested)
+	metrics.EventsIngested.Add(7)
+
+	st := &stubStore{}
+	rc := &stubRPC{health: rpc.Health{Status: "healthy"}}
+
+	resp, body := doGet(t, newTestServer(st, rc), "/stats")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var got store.Stats
+	require.NoError(t, json.Unmarshal(body, &got))
+	assert.Equal(t, uint64(before)+7, got.EventsIngestedTotal,
+		"events_ingested_total must reflect the live Prometheus counter, not stay at zero")
+}
+
+// TestStats_Cache verifies the /stats TTL cache end-to-end: repeated calls
+// within the window hit the cache (the store is consulted once), and the value
+// refreshes after the TTL expires.
+func TestStats_Cache(t *testing.T) {
+	t.Run("repeated calls within TTL hit the cache", func(t *testing.T) {
+		st := &stubStore{stats: store.Stats{TotalEvents: 42, LastIngestedLedger: 999}}
+		s := newTestServer(st, nil)
+		s.SetStatsTTL(30 * time.Second)
+
+		resp1, body1 := doGet(t, s, "/stats")
+		require.Equal(t, http.StatusOK, resp1.StatusCode, string(body1))
+		resp2, body2 := doGet(t, s, "/stats")
+		require.Equal(t, http.StatusOK, resp2.StatusCode, string(body2))
+
+		require.Equal(t, 1, st.statsCalls,
+			"both requests inside the TTL must be served from cache, so the store is hit once")
+		assert.Equal(t, string(body1), string(body2), "cached responses must be identical")
+		var got store.Stats
+		require.NoError(t, json.Unmarshal(body2, &got))
+		assert.Equal(t, int64(42), got.TotalEvents)
+	})
+
+	t.Run("values refresh after expiry", func(t *testing.T) {
+		st := &stubStore{stats: store.Stats{TotalEvents: 42, LastIngestedLedger: 999}}
+		s := newTestServer(st, nil)
+		s.SetStatsTTL(30 * time.Millisecond)
+
+		_, _ = doGet(t, s, "/stats")
+		_, _ = doGet(t, s, "/stats")
+		require.Equal(t, 1, st.statsCalls, "first two calls within TTL cache")
+
+		// Let the TTL elapse, then the next call must recompute.
+		time.Sleep(50 * time.Millisecond)
+		_, body := doGet(t, s, "/stats")
+		require.Equal(t, 2, st.statsCalls, "after expiry the store is consulted again")
+
+		var got store.Stats
+		require.NoError(t, json.Unmarshal(body, &got))
+		assert.Equal(t, int64(42), got.TotalEvents, "refreshed value is present")
+	})
+
+	t.Run("zero TTL disables caching", func(t *testing.T) {
+		st := &stubStore{stats: store.Stats{TotalEvents: 1}}
+		s := newTestServer(st, nil) // default TTL 0 disables caching
+
+		_, _ = doGet(t, s, "/stats")
+		_, _ = doGet(t, s, "/stats")
+		require.Equal(t, 2, st.statsCalls, "without a configured TTL every request recomputes")
+	})
+
+	t.Run("no-store header retained on cached hits", func(t *testing.T) {
+		st := &stubStore{stats: store.Stats{TotalEvents: 1}}
+		s := newTestServer(st, nil)
+		s.SetStatsTTL(30 * time.Second)
+
+		resp1, _ := doGet(t, s, "/stats")
+		resp2, _ := doGet(t, s, "/stats")
+		require.Equal(t, http.StatusOK, resp1.StatusCode)
+		require.Equal(t, "no-store", resp1.Header.Get("Cache-Control"))
+		require.Equal(t, "no-store", resp2.Header.Get("Cache-Control"), "cached /stats must stay no-store")
 	})
 }
 
@@ -1600,6 +2073,95 @@ func TestEnvelope(t *testing.T) {
 		require.NoError(t, json.Unmarshal(body, &out))
 		assert.NotNil(t, out.Data)
 		assert.Empty(t, out.NextCursor)
+	})
+}
+
+// TestListEndpoints_TotalCountHeader covers the X-Total-Count contract on
+// every list endpoint that reports it: the header carries the unpaginated
+// total, and a failed count (or a page whose length is the total) never
+// fails the request.
+func TestListEndpoints_TotalCountHeader(t *testing.T) {
+	t.Run("dead-letters sets X-Total-Count when the count succeeds", func(t *testing.T) {
+		st := &stubStore{
+			deadLettersResult: []store.DeadLetter{{ID: 1}},
+			deadLettersCursor: "dl-cursor",
+			deadLettersCount:  7,
+		}
+		resp, _ := doGetWithAuth(t, newTestServer(st, nil), "/dead-letters?contract_id="+testContract, "test-key")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "7", resp.Header.Get("X-Total-Count"))
+	})
+
+	t.Run("dead-letters omits X-Total-Count when the count fails", func(t *testing.T) {
+		st := &stubStore{
+			deadLettersResult:   []store.DeadLetter{{ID: 1}},
+			deadLettersCountErr: errors.New("count timeout"),
+		}
+		resp, _ := doGetWithAuth(t, newTestServer(st, nil), "/dead-letters", "test-key")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Empty(t, resp.Header.Get("X-Total-Count"))
+	})
+
+	t.Run("subscriptions reports the owner-scoped total", func(t *testing.T) {
+		st := &stubStore{subscriptions: []store.Subscription{{ID: 1}, {ID: 2}}}
+		resp, _ := doGet(t, newTestServer(st, nil), "/subscriptions")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "2", resp.Header.Get("X-Total-Count"))
+	})
+
+	t.Run("subscriptions reports zero for an empty list", func(t *testing.T) {
+		resp, _ := doGet(t, newTestServer(&stubStore{}, nil), "/subscriptions")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "0", resp.Header.Get("X-Total-Count"))
+	})
+
+	t.Run("deliveries sets X-Total-Count when the count succeeds", func(t *testing.T) {
+		st := newSubErrorStub()
+		st.deliveryAttemptsCount = 12
+		resp, _ := doAPIRequest(t, newServerFromStub(st), http.MethodGet, "/subscriptions/1/deliveries", "")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "12", resp.Header.Get("X-Total-Count"))
+	})
+
+	t.Run("deliveries omits X-Total-Count when the count fails", func(t *testing.T) {
+		st := newSubErrorStub()
+		st.deliveryAttemptsCountErr = errors.New("count timeout")
+		resp, _ := doAPIRequest(t, newServerFromStub(st), http.MethodGet, "/subscriptions/1/deliveries", "")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Empty(t, resp.Header.Get("X-Total-Count"))
+	})
+
+	t.Run("watched-contracts reports the list length", func(t *testing.T) {
+		st := &stubStore{watchedList: []store.WatchedContract{
+			{ContractID: testContract},
+			{ContractID: "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"},
+		}}
+		resp, _ := doGetWithAuth(t, newTestServer(st, nil), "/watched-contracts", "test-key")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "2", resp.Header.Get("X-Total-Count"))
+	})
+
+	t.Run("contracts reports zero for an empty result set", func(t *testing.T) {
+		// An absent header would be ambiguous ("not counted" vs "zero"),
+		// so an empty page must still carry X-Total-Count: 0.
+		st := &stubStore{countContractsResult: 0}
+		resp, _ := doGet(t, newTestServer(st, nil), "/contracts")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "0", resp.Header.Get("X-Total-Count"))
+	})
+
+	t.Run("contracts omits X-Total-Count when the count fails", func(t *testing.T) {
+		st := &stubStore{countContractsErr: errors.New("count timeout")}
+		resp, _ := doGet(t, newTestServer(st, nil), "/contracts")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Empty(t, resp.Header.Get("X-Total-Count"))
+	})
+
+	t.Run("address events sets X-Total-Count from the store count", func(t *testing.T) {
+		st := &stubStore{addressEvents: []store.Event{{ID: "e1"}}, addressCount: 3}
+		resp, _ := doGet(t, newTestServer(st, nil), "/addresses/"+testAddress+"/events")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "3", resp.Header.Get("X-Total-Count"))
 	})
 }
 
@@ -2312,6 +2874,20 @@ func TestListEvents_ConfigurableMaxLimit(t *testing.T) {
 	}
 }
 
+// The API's default page cap must stay aligned with the store's hard
+// clamp: both default to 500, and raising API_MAX_LIMIT above
+// store.MaxQueryLimit would let the API accept a limit the store then
+// silently clamps, so a caller would get a short page with no error.
+// See the comments on store.MaxQueryLimit and maxLimit in server.go.
+func TestMaxLimitAlignsWithStoreClamp(t *testing.T) {
+	SetMaxLimit(500) // restore the default; other tests may have changed it
+	t.Cleanup(func() { SetMaxLimit(500) })
+
+	assert.Equal(t, store.MaxQueryLimit, maxLimit,
+		"API default maxLimit and store.MaxQueryLimit must stay in lockstep; "+
+			"an API_MAX_LIMIT above store.MaxQueryLimit is silently clamped by the store")
+}
+
 func TestGetEventTransaction_Success(t *testing.T) {
 	st := &stubStore{
 		event: store.Event{ID: "0001-0001", TxHash: "abc123"},
@@ -2434,3 +3010,87 @@ func (m *stubStore) GetDeadLetter(context.Context, int64) (store.DeadLetter, err
 	return store.DeadLetter{}, store.ErrNotFound
 }
 func (m *stubStore) DeleteDeadLetter(context.Context, int64) error { return nil }
+func (m *stubStore) CountDeadLetters(context.Context, string) (int64, error) {
+	return m.deadLettersCount, m.deadLettersCountErr
+}
+func (m *stubStore) CountDeliveryAttempts(context.Context, int64, store.SubscriptionOwner) (int64, error) {
+	return m.deliveryAttemptsCount, m.deliveryAttemptsCountErr
+}
+
+func (s *stubStore) CountEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
+	return 0, nil
+}
+
+// mockEnricher is a canned api.Enricher for testing that decode errors and
+// decode metrics propagate through the HTTP layer.
+type mockEnricher struct {
+	enriched []store.EnrichedEvent
+	stats    store.DecodeStats
+}
+
+func (m *mockEnricher) EnrichEvents(_ context.Context, events []store.Event) []store.EnrichedEvent {
+	if m.enriched != nil {
+		return m.enriched
+	}
+	out := make([]store.EnrichedEvent, len(events))
+	for i, e := range events {
+		out[i] = store.EnrichedEvent{Event: e, Decoded: false}
+	}
+	return out
+}
+
+func (m *mockEnricher) DecodeStats() store.DecodeStats { return m.stats }
+
+func TestListEvents_EnrichedResponseSurfaceDecodeError(t *testing.T) {
+	st := &stubStore{events: []store.Event{{
+		ID:     "0001-0001",
+		Topics: json.RawMessage(`[{"symbol":"transfer"}]`),
+		Value:  json.RawMessage(`{"i128":"5000"}`),
+	}}}
+	s := New(st, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "",
+		&mockEnricher{enriched: []store.EnrichedEvent{{
+			Event: store.Event{
+				ID:     "0001-0001",
+				Topics: json.RawMessage(`[{"symbol":"transfer"}]`),
+				Value:  json.RawMessage(`{"i128":"5000"}`),
+			},
+			Decoded:     false,
+			DecodeError: "decoding topic field \"from\": cannot decode",
+		}}})
+
+	resp, body := doGet(t, s, "/events?decoded=true")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+
+	// A failed decode returns the raw event plus decode_error.
+	var got struct {
+		Events []struct {
+			ID          string          `json:"id"`
+			Topics      json.RawMessage `json:"topics"`
+			Decoded     bool            `json:"decoded"`
+			DecodeError string          `json:"decode_error"`
+		} `json:"events"`
+	}
+	require.NoError(t, json.Unmarshal(body, &got))
+	require.Len(t, got.Events, 1)
+	assert.Equal(t, "0001-0001", got.Events[0].ID) // raw event preserved
+	assert.Equal(t, `[{"symbol":"transfer"}]`, string(got.Events[0].Topics))
+	assert.False(t, got.Events[0].Decoded)
+	assert.Contains(t, got.Events[0].DecodeError, "topic")
+}
+
+func TestStats_SurfaceDecodeMetrics(t *testing.T) {
+	st := &stubStore{stats: store.Stats{LastIngestedLedger: 512}}
+	s := New(st, &stubRPC{health: rpc.Health{Status: "healthy", LatestLedger: 1024}},
+		slog.New(slog.NewTextHandler(io.Discard, nil)), "",
+		&mockEnricher{stats: store.DecodeStats{Decodes: 100, DecodeFailures: 3}})
+
+	resp, body := doGet(t, s, "/stats")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(body, &raw))
+	got, ok := raw["decode"].(map[string]any)
+	require.True(t, ok, "expected decode block in /stats: %s", string(body))
+	assert.Equal(t, float64(100), got["decodes"])
+	assert.Equal(t, float64(3), got["decode_failures"])
+}

@@ -52,17 +52,30 @@ func requireSchema(t *testing.T, pool *pgxpool.Pool) {
 				"raw_topic_xdr", "raw_value_xdr",
 			},
 			indexes: []string{
-				"idx_events_contract_id",
 				"idx_events_ledger",
+				"idx_events_tx_hash",
+				"idx_events_contract_ledger_id",
+				"idx_events_contract_id_id",
 			},
 		},
 		{
-			table:   "ingestion_state",
-			columns: []string{"id", "last_ingested_ledger", "last_cursor", "updated_at"},
+			// Ingestion state is keyed by network so each network can resume
+			// independently with its own cursor and ledger frontier.
+			table: "ingestion_state",
+			columns: []string{
+				"network", "last_ingested_ledger", "last_cursor",
+				"last_successful_poll", "updated_at",
+			},
 		},
 		{
+			// audit_state is keyed by network, not by the singleton id the
+			// table was created with: GetAuditState selects WHERE network = $1
+			// and SaveAuditState upserts ON CONFLICT (network). The original
+			// id column had CHECK (id = 1) and no default, so it would have
+			// rejected those inserts, and 0005_network_column drops it.
+			// sqlite.go still uses id = 1 against its own migration series.
 			table:   "audit_state",
-			columns: []string{"id", "verified_through_ledger", "updated_at"},
+			columns: []string{"network", "verified_through_ledger", "updated_at"},
 		},
 		{
 			table: "audit_findings",

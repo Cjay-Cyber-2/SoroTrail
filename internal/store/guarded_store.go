@@ -185,11 +185,21 @@ func (s *guardedStore) SaveAuditStateIfGreater(ctx context.Context, network stri
 }
 
 func (s *guardedStore) GetContractSummary(ctx context.Context, contractID string) (ContractSummary, error) {
-	return s.Store.GetContractSummary(ctx, contractID)
+	ctx, cancel := s.wrapContext(ctx, "store.GetContractSummary")
+	defer cancel()
+	start := time.Now()
+	summary, err := s.Store.GetContractSummary(ctx, contractID)
+	s.logSlowQuery("store.GetContractSummary", start, err)
+	return summary, err
 }
 
 func (s *guardedStore) ContractEventTypeCounts(ctx context.Context, contractID string) ([]ContractEventTypeCount, error) {
-	return s.Store.ContractEventTypeCounts(ctx, contractID)
+	ctx, cancel := s.wrapContext(ctx, "store.ContractEventTypeCounts")
+	defer cancel()
+	start := time.Now()
+	counts, err := s.Store.ContractEventTypeCounts(ctx, contractID)
+	s.logSlowQuery("store.ContractEventTypeCounts", start, err)
+	return counts, err
 }
 
 func (s *guardedStore) ListContracts(ctx context.Context, f ContractsFilter) ([]ContractSummary, string, error) {
@@ -372,6 +382,33 @@ func (s *guardedStore) SetContractSpec(ctx context.Context, wasmHash, contractID
 	return err
 }
 
+func (s *guardedStore) GetContractSpecOverride(ctx context.Context, contractID string) ([]byte, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.GetContractSpecOverride")
+	defer cancel()
+	start := time.Now()
+	spec, err := s.Store.GetContractSpecOverride(ctx, contractID)
+	s.logSlowQuery("store.GetContractSpecOverride", start, err)
+	return spec, err
+}
+
+func (s *guardedStore) SetContractSpecOverride(ctx context.Context, contractID string, specJSON []byte) error {
+	ctx, cancel := s.wrapContext(ctx, "store.SetContractSpecOverride")
+	defer cancel()
+	start := time.Now()
+	err := s.Store.SetContractSpecOverride(ctx, contractID, specJSON)
+	s.logSlowQuery("store.SetContractSpecOverride", start, err)
+	return err
+}
+
+func (s *guardedStore) DeleteContractSpecOverride(ctx context.Context, contractID string) error {
+	ctx, cancel := s.wrapContext(ctx, "store.DeleteContractSpecOverride")
+	defer cancel()
+	start := time.Now()
+	err := s.Store.DeleteContractSpecOverride(ctx, contractID)
+	s.logSlowQuery("store.DeleteContractSpecOverride", start, err)
+	return err
+}
+
 func (s *guardedStore) DeleteEventsBeforeLedger(ctx context.Context, beforeLedger int64) (int64, error) {
 	ctx, cancel := s.wrapContext(ctx, "store.DeleteEventsBeforeLedger")
 	defer cancel()
@@ -381,6 +418,23 @@ func (s *guardedStore) DeleteEventsBeforeLedger(ctx context.Context, beforeLedge
 	return n, err
 }
 
+func (s *guardedStore) DeleteEventsBefore(ctx context.Context, maxLedger int64, beforeTime time.Time, limit int) (int64, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.DeleteEventsBefore")
+	defer cancel()
+	start := time.Now()
+	n, err := s.Store.DeleteEventsBefore(ctx, maxLedger, beforeTime, limit)
+	s.logSlowQuery("store.DeleteEventsBefore", start, err)
+	return n, err
+}
+
+func (s *guardedStore) CountEventsBefore(ctx context.Context, maxLedger int64, beforeTime time.Time, limit int) (int64, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.CountEventsBefore")
+	defer cancel()
+	start := time.Now()
+	n, err := s.Store.CountEventsBefore(ctx, maxLedger, beforeTime, limit)
+	s.logSlowQuery("store.CountEventsBefore", start, err)
+	return n, err
+}
 func (s *guardedStore) MigrationVersion(ctx context.Context) (int, bool, error) {
 	// Migration version queries are cheap — no timeout needed.
 	return s.Store.MigrationVersion(ctx)
@@ -429,6 +483,24 @@ func (s *guardedStore) CountAddressEvents(ctx context.Context, address string) (
 	start := time.Now()
 	total, err := s.Store.CountAddressEvents(ctx, address)
 	s.logSlowQuery("store.CountAddressEvents", start, err)
+	return total, err
+}
+
+func (s *guardedStore) CountDeadLetters(ctx context.Context, contractID string) (int64, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.CountDeadLetters")
+	defer cancel()
+	start := time.Now()
+	total, err := s.Store.CountDeadLetters(ctx, contractID)
+	s.logSlowQuery("store.CountDeadLetters", start, err)
+	return total, err
+}
+
+func (s *guardedStore) CountDeliveryAttempts(ctx context.Context, subscriptionID int64, owner SubscriptionOwner) (int64, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.CountDeliveryAttempts")
+	defer cancel()
+	start := time.Now()
+	total, err := s.Store.CountDeliveryAttempts(ctx, subscriptionID, owner)
+	s.logSlowQuery("store.CountDeliveryAttempts", start, err)
 	return total, err
 }
 

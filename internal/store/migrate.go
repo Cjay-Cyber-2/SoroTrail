@@ -38,7 +38,7 @@ func Migrate(databaseURL string) error {
 // SQLite series; Postgres runs the embedded Postgres series via golang-migrate.
 func MigrateUp(databaseURL string, steps int) error {
 	if strings.HasPrefix(databaseURL, "clickhouse://") {
-		return nil
+		return migrateClickHouse(databaseURL)
 	}
 	if isSQLiteURL(databaseURL) {
 		return migrateSQLiteUp(databaseURL, steps)

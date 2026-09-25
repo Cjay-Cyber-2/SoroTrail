@@ -2,9 +2,13 @@ package rpc
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"time"
+
+	"github.com/sorotrail/sorotrail/internal/metrics"
 )
 
 // RetryConfig controls the retry/backoff behaviour applied to every RPC call
@@ -18,10 +22,23 @@ type RetryConfig struct {
 	// MaxBackoff caps the backoff duration. Each retry doubles BaseBackoff
 	// but never exceeds MaxBackoff.
 	MaxBackoff time.Duration
-	// Jitter, when true, randomises each backoff to [0.5×backoff, 1.5×backoff)
-	// so concurrent retries don't thundering-herd the endpoint.
+	// Jitter, when true, randomises each computed backoff to
+	// [0.5×backoff, 1.5×backoff) so concurrent retries don't
+	// thundering-herd the endpoint. Never applied to a provider-supplied
+	// Retry-After wait, which is honored as-is (capped).
 	Jitter bool
+	// Logger, when non-nil, receives debug lines describing each scheduled
+	// retry and where its wait came from ("retry_after" vs "backoff").
+	// Nil falls back to slog.Default(); Debug level means silent in
+	// default deployments.
+	Logger *slog.Logger
 }
+
+// maxRetryAfterWait caps how long a single Retry-After hint may make one
+// retry wait. Providers occasionally send absurd values (an hour, or a date
+// typo years out); hanging a call that long would stall ingestion far worse
+// than a few extra 429s would.
+const maxRetryAfterWait = 60 * time.Second
 
 // RetryClient wraps any Client and retries calls on transient errors with
 // exponential backoff. Non-retryable errors (context cancellation, invalid
@@ -49,10 +66,11 @@ func NewRetryClient(inner Client, cfg RetryConfig) *RetryClient {
 }
 
 // doWithRetry runs fn, retrying on transient errors with exponential backoff.
-// fn should return a retryable error or a non-retryable error that should
-// surface immediately. The context passed to fn carries the overall deadline,
-// and backoff sleep respects ctx cancellation.
-func (c *RetryClient) doWithRetry(ctx context.Context, fn func(context.Context) error) error {
+// method is the JSON-RPC method name and is used to label the retry and
+// backoff metrics. fn should return a retryable error or a non-retryable
+// error that should surface immediately. The context passed to fn carries
+// the overall deadline, and backoff sleep respects ctx cancellation.
+func (c *RetryClient) doWithRetry(ctx context.Context, method string, fn func(context.Context) error) error {
 	var lastErr error
 	backoff := c.config.BaseBackoff
 	for attempt := 1; attempt <= c.config.MaxAttempts; attempt++ {
@@ -69,14 +87,17 @@ func (c *RetryClient) doWithRetry(ctx context.Context, fn func(context.Context) 
 			return err
 		}
 		if attempt < c.config.MaxAttempts {
-			// Exponential backoff with optional jitter.
-			d := backoff
-			if c.config.Jitter {
-				// jitter in [0.5×d, 1.5×d)
-				half := d / 2
-				d = half + rand.N(d)
-			}
-			if !sleepCtx(ctx, d) {
+			wait, source := c.retryWait(err, backoff)
+			// Retries and the time spent sleeping between them are the
+			// first signal that the upstream is slow or throttling.
+			metrics.RPCRetriesTotal.WithLabelValues(method, source).Inc()
+			metrics.RPCBackoffSeconds.WithLabelValues(method).Add(wait.Seconds())
+			c.log().Debug("rpc retry scheduled",
+				"attempt", attempt,
+				"wait", wait.String(),
+				"source", source,
+				"error", err.Error())
+			if !sleepCtx(ctx, wait) {
 				return ctx.Err()
 			}
 			backoff *= 2
@@ -86,6 +107,36 @@ func (c *RetryClient) doWithRetry(ctx context.Context, fn func(context.Context) 
 		}
 	}
 	return fmt.Errorf("exhausted %d retries: %w", c.config.MaxAttempts, lastErr)
+}
+
+// retryWait decides how long to wait before the next attempt. When the
+// provider sent a Retry-After hint (HTTP 429), that hint wins outright —
+// it is capped at maxRetryAfterWait but never jittered or shrunk, because
+// retrying earlier than told only earns another 429. Any other failure
+// uses the running exponential backoff with optional jitter.
+func (c *RetryClient) retryWait(err error, backoff time.Duration) (time.Duration, string) {
+	var rle *RateLimitedError
+	if errors.As(err, &rle) && rle.RetryAfter > 0 {
+		d := rle.RetryAfter
+		if d > maxRetryAfterWait {
+			d = maxRetryAfterWait
+		}
+		return d, "retry_after"
+	}
+	d := backoff
+	if c.config.Jitter {
+		// jitter in [0.5×d, 1.5×d)
+		half := d / 2
+		d = half + rand.N(d)
+	}
+	return d, "backoff"
+}
+
+func (c *RetryClient) log() *slog.Logger {
+	if c.config.Logger != nil {
+		return c.config.Logger
+	}
+	return slog.Default()
 }
 
 // isRetryable reports whether err is worth retrying. Context cancellation,
@@ -98,6 +149,12 @@ func isRetryable(err error) bool {
 	// Context cancellation is never retryable.
 	if isContextErr(err) {
 		return false
+	}
+	// HTTP 429 is the provider telling us to slow down — always worth
+	// retrying, ideally after its Retry-After hint (see retryWait).
+	var rateLimited *RateLimitedError
+	if errors.As(err, &rateLimited) {
+		return true
 	}
 	// JSON-RPC error objects: codes ≥ -32000 are server errors.
 	var rpcErr *Error
@@ -193,7 +250,7 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 
 func (c *RetryClient) GetEvents(ctx context.Context, req GetEventsRequest) (GetEventsResponse, error) {
 	var resp GetEventsResponse
-	err := c.doWithRetry(ctx, func(ctx context.Context) error {
+	err := c.doWithRetry(ctx, "getEvents", func(ctx context.Context) error {
 		var innerErr error
 		resp, innerErr = c.inner.GetEvents(ctx, req)
 		return innerErr
@@ -203,7 +260,7 @@ func (c *RetryClient) GetEvents(ctx context.Context, req GetEventsRequest) (GetE
 
 func (c *RetryClient) GetLatestLedger(ctx context.Context) (LatestLedger, error) {
 	var resp LatestLedger
-	err := c.doWithRetry(ctx, func(ctx context.Context) error {
+	err := c.doWithRetry(ctx, "getLatestLedger", func(ctx context.Context) error {
 		var innerErr error
 		resp, innerErr = c.inner.GetLatestLedger(ctx)
 		return innerErr
@@ -213,7 +270,7 @@ func (c *RetryClient) GetLatestLedger(ctx context.Context) (LatestLedger, error)
 
 func (c *RetryClient) GetHealth(ctx context.Context) (Health, error) {
 	var resp Health
-	err := c.doWithRetry(ctx, func(ctx context.Context) error {
+	err := c.doWithRetry(ctx, "getHealth", func(ctx context.Context) error {
 		var innerErr error
 		resp, innerErr = c.inner.GetHealth(ctx)
 		return innerErr
@@ -223,7 +280,7 @@ func (c *RetryClient) GetHealth(ctx context.Context) (Health, error) {
 
 func (c *RetryClient) SimulateTransaction(ctx context.Context, req SimulateTransactionRequest) (SimulateTransactionResponse, error) {
 	var resp SimulateTransactionResponse
-	err := c.doWithRetry(ctx, func(ctx context.Context) error {
+	err := c.doWithRetry(ctx, "simulateTransaction", func(ctx context.Context) error {
 		var innerErr error
 		resp, innerErr = c.inner.SimulateTransaction(ctx, req)
 		return innerErr
@@ -233,7 +290,7 @@ func (c *RetryClient) SimulateTransaction(ctx context.Context, req SimulateTrans
 
 func (c *RetryClient) GetLedgerEntries(ctx context.Context, req GetLedgerEntriesRequest) (GetLedgerEntriesResponse, error) {
 	var resp GetLedgerEntriesResponse
-	err := c.doWithRetry(ctx, func(ctx context.Context) error {
+	err := c.doWithRetry(ctx, "getLedgerEntries", func(ctx context.Context) error {
 		var innerErr error
 		resp, innerErr = c.inner.GetLedgerEntries(ctx, req)
 		return innerErr

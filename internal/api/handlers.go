@@ -2,6 +2,7 @@ package api
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 
 	"crypto/sha256"
@@ -17,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"reflect"
 
 	"strconv"
 
@@ -28,40 +30,68 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/go-chi/chi/v5"
+	dto "github.com/prometheus/client_model/go"
 
 	"github.com/sorotrail/sorotrail/internal/api/queries"
 	"github.com/sorotrail/sorotrail/internal/broadcast"
 	"github.com/sorotrail/sorotrail/internal/buildinfo"
 	"github.com/sorotrail/sorotrail/internal/config"
+	"github.com/sorotrail/sorotrail/internal/metrics"
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
+// maxJSONBodyBytes caps a JSON request body decoded by decodeJSONBody.
+// Every body it serves is a small control-plane object, so anything larger
+// is a client error, not something to buffer.
+const maxJSONBodyBytes = 4 << 10
+
 // decodeJSONBody parses a single small JSON body (≤4 KiB), rejecting
-
 // unknown fields so a typo like {"contractID": "..."} doesn't fall
-
 // through with an empty contract_id and a confusing 400 from a later
-// check.
+// check. On success dst is overwritten with the decoded value; on any
+// error it is left untouched. Error text never quotes the body's values.
 func decodeJSONBody(r *http.Request, dst any) error {
-
+	rv := reflect.ValueOf(dst)
+	if rv.Kind() != reflect.Pointer || rv.IsNil() {
+		return fmt.Errorf("decodeJSONBody: dst must be a non-nil pointer, got %T", dst)
+	}
+	// Server requests always carry a non-nil Body, so an absent body shows
+	// up as zero bytes below; the nil check covers hand-built requests.
 	if r.Body == nil {
-
 		return errors.New("request body is empty")
-
 	}
 
-	dec := json.NewDecoder(io.LimitReader(r.Body, 4<<10))
+	// Read one byte past the cap so an oversized body is reported as too
+	// large instead of being truncated into a misleading "unexpected EOF".
+	// At most maxJSONBodyBytes+1 bytes are ever buffered.
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxJSONBodyBytes+1))
+	if err != nil {
+		return fmt.Errorf("reading request body: %w", err)
+	}
+	if len(body) > maxJSONBodyBytes {
+		return fmt.Errorf("request body exceeds %d bytes", maxJSONBodyBytes)
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return errors.New("request body is empty")
+	}
 
+	// Decode into a scratch value and publish it only on success:
+	// encoding/json keeps filling fields after a type mismatch or an
+	// unknown field, and a half-populated struct must never reach a handler.
+	tmp := reflect.New(rv.Elem().Type())
+	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
-
-	if err := dec.Decode(dst); err != nil {
-
+	if err := dec.Decode(tmp.Interface()); err != nil {
 		return fmt.Errorf("invalid JSON body: %w", err)
-
 	}
-
+	// The body is exactly one JSON value. Trailing data means the client
+	// sent something other than what was decoded, so reject it rather than
+	// act on the first value alone.
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return errors.New("invalid JSON body: unexpected data after the JSON value")
+	}
+	rv.Elem().Set(tmp.Elem())
 	return nil
-
 }
 
 var cachePrivate atomic.Bool
@@ -151,6 +181,11 @@ type eventsWithXDRResponse struct {
 	Cursor string         `json:"cursor,omitempty"`
 }
 
+type addressEventsResponse struct {
+	Events []store.Event `json:"events"`
+	Cursor string        `json:"cursor,omitempty"`
+}
+
 // envelopeResponse is the JSON body returned when ?envelope=true is set on
 // any paginated list endpoint. It normalises the response shape across all
 // list endpoints so clients that prefer a consistent outer wrapper don't
@@ -169,6 +204,14 @@ type envelopeResponse struct {
 // next-page cursor. It is a convenience constructor so call sites stay
 // single-line.
 func wrapEnvelope(data any, cursor string) envelopeResponse {
+	// data is documented as "array, never null". A handler with no rows to
+	// return usually holds a nil slice, which marshals to null and forces
+	// every client to handle both shapes; normalise it to an empty array of
+	// the same element type here, at the one place every caller passes
+	// through.
+	if rv := reflect.ValueOf(data); rv.Kind() == reflect.Slice && rv.IsNil() {
+		data = reflect.MakeSlice(rv.Type(), 0, 0).Interface()
+	}
 	return envelopeResponse{Data: data, NextCursor: cursor}
 }
 
@@ -368,6 +411,11 @@ func eventToMap(ev store.Event, fields map[string]bool) map[string]any {
 
 }
 
+// handleHealth is the liveness probe. It reports whether the process
+// is alive and able to serve HTTP requests. It intentionally does NOT
+// check external dependencies (database, RPC) so a dependency outage
+// cannot trigger a restart loop — that is the readiness probe's job
+// (see handleReadyz).
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -447,7 +495,7 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		// Only check lag if we have an ingestion state and an RPC client.
 		if s.rpc != nil {
 			if health, err := s.rpc.GetHealth(ctx); err == nil {
-				lag := int64(health.LatestLedger) - state.LastIngestedLedger
+				lag := ingestLagLedgers(int64(health.LatestLedger), state.LastIngestedLedger)
 				if lag > 100 && state.LastIngestedLedger > 0 {
 					resp.Status = "degraded"
 					resp.Checks["ingestion_lag"] = fmt.Sprintf(
@@ -493,6 +541,9 @@ func (s *Server) handleDeleteEvents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("deleting events failed"))
 		return
 	}
+	// A destructive write must never be replayed from a cache: the same
+	// URL answered twice could delete a different range the second time.
+	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, http.StatusOK, map[string]int64{"deleted": deleted})
 }
 
@@ -626,6 +677,48 @@ const streamBatchSize = 500
 // the value is the bare "true" (no explicit count).
 const recentDefaultLimit = 20
 
+// decodeMode is how a request wants stored event bodies rendered. It is
+// parsed from ?decoded=, which used to be read as a bare "is it the string
+// true" flag on every handler that touched it.
+type decodeMode int
+
+const (
+	// decodeStored is the default: the stored decoding, plus the additive
+	// SEP-41 envelope for events that match a token shape.
+	decodeStored decodeMode = iota
+
+	// decodeEnriched (?decoded=true) additionally resolves events against
+	// the contract spec to produce named fields.
+	decodeEnriched
+
+	// decodeRaw (?decoded=false) is the opt-out: the stored columns are
+	// served exactly as they are, with no spec enrichment and no SEP-41
+	// envelope layered on top.
+	decodeRaw
+)
+
+// decodeModeFromQuery reads ?decoded= off a request. Only the exact strings
+// "true" and "false" carry meaning; anything else (including an absent
+// parameter) keeps the default rendering, preserving the flag semantics the
+// parameter has always had for unrecognised values.
+func decodeModeFromQuery(r *http.Request) decodeMode {
+	switch r.URL.Query().Get("decoded") {
+	case "true":
+		return decodeEnriched
+	case "false":
+		return decodeRaw
+	default:
+		return decodeStored
+	}
+}
+
+// enrich reports whether spec-driven enrichment was asked for.
+func (m decodeMode) enrich() bool { return m == decodeEnriched }
+
+// sep41 reports whether the additive SEP-41 envelope should be attached.
+// Only an explicit ?decoded=false turns it off.
+func (m decodeMode) sep41() bool { return m != decodeRaw }
+
 func (s *Server) handleListEventsStream(w http.ResponseWriter, r *http.Request) {
 
 	filter, fields, err := parseFilterAndFields(r)
@@ -644,7 +737,9 @@ func (s *Server) handleListEventsStream(w http.ResponseWriter, r *http.Request) 
 
 	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 
-	decoded := r.URL.Query().Get("decoded") == "true"
+	mode := decodeModeFromQuery(r)
+
+	decoded := mode.enrich()
 
 	ctx := r.Context()
 
@@ -909,11 +1004,19 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 		events = []store.Event{}
 	}
 
+	setPaginationHeaders(w, r, cursor)
+
+	mode := decodeModeFromQuery(r)
+
 	// Tag every event with its SEP-41 normalized envelope (if any) before
 	// rendering — the layer is additive and never destructive, so events
 	// that do not match keep exactly the same shape they had before.
-	for i := range events {
-		events[i].WithSEP41()
+	// ?decoded=false opts out: the caller wants the stored columns as they
+	// are, with nothing derived layered on top.
+	if mode.sep41() {
+		for i := range events {
+			events[i].WithSEP41()
+		}
 	}
 
 	// Total matching count (ignoring pagination) as a response header.
@@ -944,29 +1047,9 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 
 	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 
-	decoded := r.URL.Query().Get("decoded") == "true"
+	decoded := mode.enrich()
 	envelope := r.URL.Query().Get("envelope") == "true"
 	writeCacheHeaders(w, policy, immutableMaxAge, etag)
-
-	// RFC 5988 pagination links: when the store reports a next-page
-	// cursor, hand clients ready-made URLs instead of making them
-	// reassemble one. All original query params are preserved so pages
-	// keep the caller's filter; a request that arrived mid-pagination
-	// also advertises the way back to the first page via rel="prev".
-	if cursor != "" {
-		var links []string
-		if r.URL.Query().Get("cursor") != "" {
-			first := r.URL.Query()
-			first.Del("cursor")
-			prev := url.URL{Path: r.URL.Path, RawQuery: first.Encode()}
-			links = append(links, fmt.Sprintf("<%s>; rel=\"prev\"", prev.String()))
-		}
-		q := r.URL.Query()
-		q.Set("cursor", cursor)
-		next := url.URL{Path: r.URL.Path, RawQuery: q.Encode()}
-		links = append(links, fmt.Sprintf("<%s>; rel=\"next\"", next.String()))
-		w.Header().Set("Link", strings.Join(links, ", "))
-	}
 
 	if decoded && s.enricher != nil {
 
@@ -1178,7 +1261,9 @@ func (s *Server) handleGetEventTransaction(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	decoded := r.URL.Query().Get("decoded") == "true"
+	mode := decodeModeFromQuery(r)
+
+	decoded := mode.enrich()
 	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 
 	etag := `"` + id + `:tx"`
@@ -1269,11 +1354,15 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	s.recordEventsServed(r.Context(), 1)
 
-	// Additive SEP-41 normalization on the single-event path; non-matches
-	// simply omit the field.
-	event.WithSEP41()
+	mode := decodeModeFromQuery(r)
 
-	decoded := r.URL.Query().Get("decoded") == "true"
+	// Additive SEP-41 normalization on the single-event path; non-matches
+	// simply omit the field, and ?decoded=false skips it entirely.
+	if mode.sep41() {
+		event.WithSEP41()
+	}
+
+	decoded := mode.enrich()
 	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 	if decoded && s.enricher != nil {
 
@@ -1386,12 +1475,19 @@ type contractListResponse struct {
 	Cursor    string                  `json:"cursor,omitempty"`
 }
 
+// maxContractsListLimit caps ?limit= on GET /contracts. The listing is a
+// grouped scan over the events table (one row per contract), so its page
+// size is bounded tighter than the event endpoints — 1–200 with a default
+// of 50, matching the shared OpenAPI Limit parameter.
+const maxContractsListLimit = 200
+
 // handleListContracts returns one ContractSummary per indexed contract,
-// paginated, default-sorted by event_count desc (the most active
-// contracts first). The endpoint is intentionally READ-ONLY and
-// unauthenticated: a contract listing has no surface area for
-// cross-tenant data leakage (a contract_id is opaque), and gating it
-// behind API_KEY would force every browser dashboard to log in.
+// paginated, default-ordered by contract_id ascending (a stable
+// alphabetical walk; ?sort=count ranks by activity instead). The endpoint
+// is intentionally READ-ONLY and unauthenticated: a contract listing has
+// no surface area for cross-tenant data leakage (a contract_id is
+// opaque), and gating it behind API_KEY would force every browser
+// dashboard to log in.
 //
 // Cache-Control is no-cache: a brand-new contract can be ingested at
 // any time, and a stale cache would hide it from a freshly-launched
@@ -1405,10 +1501,11 @@ func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
 	}
 	if !store.ValidContractsSortKey(f.SortKey) {
 		writeError(w, http.StatusBadRequest, fmt.Errorf(
-			"invalid sort %q (want %s, %s, %s, or %s)",
+			"invalid sort %q (want %s, %s, %s, %s, or %s)",
 			f.SortKey,
-			store.SortByActivity, store.SortByFirstLedger,
-			store.SortByLastLedger, store.SortByLastSeen))
+			store.SortByContractID, store.SortByActivity,
+			store.SortByFirstLedger, store.SortByLastLedger,
+			store.SortByLastSeen))
 		return
 	}
 	if f.Order != "" && f.Order != "asc" && f.Order != "desc" {
@@ -1421,8 +1518,8 @@ func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
 	}
 	if raw := r.URL.Query().Get("limit"); raw != "" {
 		n, err := strconv.Atoi(raw)
-		if err != nil || n < 1 || n > store.MaxQueryLimit {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit))
+		if err != nil || n < 1 || n > maxContractsListLimit {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be an integer in [1,%d]", maxContractsListLimit))
 			return
 		}
 		f.Limit = n
@@ -1431,6 +1528,12 @@ func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
 	}
 	items, cursor, err := s.store.ListContracts(r.Context(), f)
 	if err != nil {
+		// A cursor that passes the charset check but not the decode is
+		// bad client input (400), not a server fault (500).
+		if errors.Is(err, store.ErrInvalidContractsCursor) {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid cursor %q", f.Cursor))
+			return
+		}
 		loggerFromContext(r.Context()).Error("listing contracts", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("listing contracts failed"))
 		return
@@ -1438,12 +1541,18 @@ func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
 	total, cerr := s.store.CountContracts(r.Context(), f)
 	if cerr != nil {
 		loggerFromContext(r.Context()).Warn("counting contracts for X-Total-Count", "error", cerr)
-	} else if total > 0 {
+	} else {
+		// The header is set even for an empty result set: a client that
+		// reads "0" learns the endpoint is healthy and there is simply
+		// nothing to page, whereas an absent header is ambiguous.
 		w.Header().Set("X-Total-Count", fmt.Sprintf("%d", total))
 	}
 	if items == nil {
 		items = []store.ContractSummary{}
 	}
+	// RFC 5988 pagination links, set before the body so the client can
+	// walk pages without reassembling cursors.
+	setPaginationHeaders(w, r, cursor)
 	writeCacheHeaders(w, cacheNoCache, 0, "")
 	if r.URL.Query().Get("envelope") == "true" {
 		writeJSON(w, http.StatusOK, wrapEnvelope(items, cursor))
@@ -1478,8 +1587,8 @@ func (s *Server) handleListDeadLetters(w http.ResponseWriter, r *http.Request) {
 	}
 	if raw := r.URL.Query().Get("limit"); raw != "" {
 		n, err := strconv.Atoi(raw)
-		if err != nil || n < 1 || n > store.MaxQueryLimit {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit))
+		if err != nil || n < 1 || n > maxLimit {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be an integer in [1,%d]", maxLimit))
 			return
 		}
 		f.Limit = n
@@ -1494,6 +1603,19 @@ func (s *Server) handleListDeadLetters(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("listing dead letters failed"))
 		return
 	}
+	// RFC 5988 pagination links, set before the body so the client can
+	// walk pages without reassembling cursors.
+	setPaginationHeaders(w, r, cursor)
+
+	// Total matching count (ignoring pagination) as a response header,
+	// following the events pattern exactly: a failed count is logged and
+	// the header omitted, never a failed request.
+	if total, cerr := s.store.CountDeadLetters(r.Context(), f.ContractID); cerr != nil {
+		loggerFromContext(r.Context()).Warn("counting dead letters for X-Total-Count", "error", cerr)
+	} else {
+		w.Header().Set("X-Total-Count", fmt.Sprintf("%d", total))
+	}
+
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	if r.URL.Query().Get("envelope") == "true" {
 		if items == nil {
@@ -1530,21 +1652,74 @@ func (s *Server) handleDeleteDeadLetter(w http.ResponseWriter, r *http.Request) 
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleStats serves the aggregate /stats response. The store aggregation and
+// RPC freshness lookup are the expensive parts, so the assembled result is
+// cached per tenant-scope for statsTTL; a request that lands within the window
+// is served from cache without touching the database. After the TTL expires
+// the next request recomputes, so values refresh automatically without a
+// background timer.
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
-	stats, err := s.store.Stats(r.Context(), scopeFrom(r.Context()))
-	if err != nil {
-
-		loggerFromContext(r.Context()).Error("loading stats", "error", err)
-
-		writeError(w, http.StatusInternalServerError, errors.New("loading stats failed"))
-
+	key := scopeFrom(r.Context()).Fingerprint()
+	if stats, ok := s.getStatsCache().Get(key, time.Now()); ok {
+		writeCacheHeaders(w, cacheNoStore, 0, "")
+		writeJSON(w, http.StatusOK, stats)
 		return
-
 	}
 
-	s.addStatsFreshness(r.Context(), &stats)
+	stats, err := s.assembleStats(r.Context())
+	if err != nil {
+		loggerFromContext(r.Context()).Error("loading stats", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("loading stats failed"))
+		return
+	}
+
+	s.getStatsCache().Put(key, stats, time.Now())
+	if sc := getSpecCache(); sc != nil {
+		stats.SpecCache = sc.SpecCacheStats()
+	}
+
+	writeCacheHeaders(w, cacheNoStore, 0, "")
+	writeJSON(w, http.StatusOK, stats)
+}
+
+// getStatsCache returns the server's per-scope cache, building it lazily on
+// first use so a Server constructed without a configured TTL never allocates
+// one until /stats is actually hit with caching enabled.
+func (s *Server) getStatsCache() *StatsCache {
+	if s.statsCache == nil {
+		s.statsCache = newStatsCache(s.statsTTL)
+	}
+	return s.statsCache
+}
+
+// assembleStats computes the full /stats payload: the store aggregate, the
+// RPC freshness fields, and the in-memory process counters (auditor, pruner,
+// recoverer, RPC errors). Callers cache the result keyed by tenant scope.
+func (s *Server) assembleStats(ctx context.Context) (store.Stats, error) {
+	stats, err := s.store.Stats(ctx, scopeFrom(ctx))
+	if err != nil {
+		return store.Stats{}, err
+	}
+
+	s.addStatsFreshness(ctx, &stats)
+
+	// Surface the ingester's last-successful-poll timestamp. Absent until
+	// the first successful cycle, so a fresh instance omits the field.
+	if state, err := s.store.GetIngestionState(ctx); err == nil && state.LastSuccessfulPoll != nil {
+		stats.LastSuccessfulPoll = state.LastSuccessfulPoll
+	}
 
 	stats.PanicsRecovered = s.recoverer.PanicsRecovered()
+
+	// EventsIngestedTotal mirrors the sorotrail_events_ingested_total
+	// Prometheus counter, read via Write rather than a second counter so
+	// /stats and /metrics can never drift apart. The counter (and so this
+	// field) is cumulative since process start, not all-time: it resets
+	// across restarts along with every other in-memory counter here.
+	var ingestedMetric dto.Metric
+	if err := metrics.EventsIngested.Write(&ingestedMetric); err == nil {
+		stats.EventsIngestedTotal = uint64(ingestedMetric.GetCounter().GetValue())
+	}
 
 	if a := getAuditor(); a != nil {
 
@@ -1594,10 +1769,18 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 
 	}
 
-	writeCacheHeaders(w, cacheNoStore, 0, "")
+	if ing := getIngester(); ing != nil {
+		stats.Ingester = store.IngesterStats{
+			EffectivePollIntervalMs: ing.EffectivePollInterval().Milliseconds(),
+		}
+	}
 
-	writeJSON(w, http.StatusOK, stats)
+	if s.enricher != nil {
+		d := s.enricher.DecodeStats()
+		stats.Decode = &d
+	}
 
+	return stats, nil
 }
 
 // Watched contracts types.
@@ -1637,13 +1820,20 @@ func (s *Server) handleListWatchedChains(w http.ResponseWriter, r *http.Request)
 
 	if err != nil {
 
-		s.log.Error("listing watched contracts", "error", err)
+		loggerFromContext(r.Context()).Error("listing watched contracts", "error", err)
 
 		writeError(w, http.StatusInternalServerError, errors.New("loading watched contracts failed"))
 
 		return
 
 	}
+
+	// The watch list is operator state that changes whenever a contract
+	// is added or removed; a cached copy would silently go stale.
+	writeCacheHeaders(w, cacheNoStore, 0, "")
+	// The whole watch list is returned on one page, so the total is just
+	// the page size; no separate count query is needed.
+	w.Header().Set("X-Total-Count", fmt.Sprintf("%d", len(contracts)))
 
 	writeJSON(w, http.StatusOK, watchedListResponse{Contracts: contracts, Count: len(contracts)})
 
@@ -1675,7 +1865,7 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 
-		s.log.Error("listing watched contracts for add", "error", err)
+		loggerFromContext(r.Context()).Error("listing watched contracts for add", "error", err)
 
 		writeError(w, http.StatusInternalServerError, errors.New("loading watched contracts failed"))
 
@@ -1706,7 +1896,7 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 	state, err := s.store.GetIngestionState(r.Context())
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 
-		s.log.Error("loading ingestion state for add", "error", err)
+		loggerFromContext(r.Context()).Error("loading ingestion state for add", "error", err)
 
 		writeError(w, http.StatusInternalServerError, errors.New("loading ingestion state failed"))
 
@@ -1716,7 +1906,7 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 
 	if err := s.store.AddWatchedContract(r.Context(), req.ContractID); err != nil {
 
-		s.log.Error("adding watched contract", "contract_id", req.ContractID, "error", err)
+		loggerFromContext(r.Context()).Error("adding watched contract", "contract_id", req.ContractID, "error", err)
 
 		writeError(w, http.StatusInternalServerError, errors.New("adding watched contract failed"))
 
@@ -1744,6 +1934,10 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 			historyFrom = start
 		}
 	}
+
+	// A write whose result depends on ingestion state must never be
+	// replayed from a cache.
+	writeCacheHeaders(w, cacheNoStore, 0, "")
 
 	writeJSON(w, http.StatusOK, addWatchedResponse{
 
@@ -1776,7 +1970,7 @@ func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request
 
 	if err != nil {
 
-		s.log.Error("listing watched contracts for remove", "error", err)
+		loggerFromContext(r.Context()).Error("listing watched contracts for remove", "error", err)
 
 		writeError(w, http.StatusInternalServerError, errors.New("loading watched contracts failed"))
 
@@ -1814,13 +2008,17 @@ func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request
 
 		}
 
-		s.log.Error("removing watched contract", "contract_id", id, "error", err)
+		loggerFromContext(r.Context()).Error("removing watched contract", "contract_id", id, "error", err)
 
 		writeError(w, http.StatusInternalServerError, errors.New("removing watched contract failed"))
 
 		return
 
 	}
+
+	// A write whose result depends on ingestion state must never be
+	// replayed from a cache.
+	writeCacheHeaders(w, cacheNoStore, 0, "")
 
 	writeJSON(w, http.StatusOK, removeWatchedResponse{
 
@@ -1869,6 +2067,9 @@ func (s *Server) handleAddressEvents(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Total-Count", fmt.Sprintf("%d", total))
 	}
 
+	// RFC 5988 pagination links, set before the body so the client can
+	// walk pages without reassembling cursors.
+	setPaginationHeaders(w, r, cursor)
 	writeCacheHeaders(w, cacheNoCache, 0, "")
 	envelope := r.URL.Query().Get("envelope") == "true"
 	if envelope {
@@ -1876,6 +2077,38 @@ func (s *Server) handleAddressEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, addressEventsResponse{Events: events, Cursor: cursor})
+}
+
+func (s *Server) addStatsFreshness(ctx context.Context, stats *store.Stats) {
+
+	if s.rpc == nil {
+
+		return
+
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+
+	defer cancel()
+
+	health, err := s.rpc.GetHealth(ctx)
+
+	if err != nil {
+
+		loggerFromContext(ctx).Warn("loading RPC health for stats", "error", err)
+
+		return
+
+	}
+
+	head := int64(health.LatestLedger)
+
+	lag := ingestLagLedgers(head, stats.LastIngestedLedger)
+
+	stats.ChainHeadLedger = &head
+
+	stats.IngestLagLedgers = &lag
+
 }
 
 // handleAddressSummary returns aggregate information about an address's
@@ -1919,50 +2152,15 @@ func isValidAddress(s string) bool {
 	return true
 }
 
-// addressEventsResponse is the response shape for GET /addresses/{address}/events.
-type addressEventsResponse struct {
-	Events []store.Event `json:"events"`
-	Cursor string        `json:"cursor,omitempty"`
-}
-
-func (s *Server) addStatsFreshness(ctx context.Context, stats *store.Stats) {
-
-	if s.rpc == nil {
-
-		return
-
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-
-	defer cancel()
-
-	health, err := s.rpc.GetHealth(ctx)
-
-	if err != nil {
-
-		loggerFromContext(ctx).Warn("loading RPC health for stats", "error", err)
-
-		return
-
-	}
-
-	head := int64(health.LatestLedger)
-
-	lag := ingestLagLedgers(head, stats.LastIngestedLedger)
-
-	stats.ChainHeadLedger = &head
-
-	stats.IngestLagLedgers = &lag
-
-}
-
 func ingestLagLedgers(chainHead, lastIngested int64) int64 {
-	if lastIngested <= 0 {
+	if chainHead <= 0 || lastIngested <= 0 {
 		return 0
 	}
-	return chainHead - lastIngested
-
+	lag := chainHead - lastIngested
+	if lag < 0 {
+		return 0
+	}
+	return lag
 }
 
 func (s *Server) listCachePolicy(ctx context.Context, filter store.EventFilter) (cacheability, string, error) {
@@ -2169,6 +2367,53 @@ func ifNoneMatch(r *http.Request, etag string) bool {
 
 }
 
+// setPaginationHeaders emits RFC 5988 Link headers for the paginated list
+// endpoints: rel="next" whenever the store returned a continuation cursor,
+// and rel="prev" whenever the caller supplied one. It must run before the
+// body is written, since writeJSON commits the status line.
+func setPaginationHeaders(w http.ResponseWriter, r *http.Request, nextCursor string) {
+	var links []string
+	if nextCursor != "" {
+		links = append(links, fmt.Sprintf(`<%s>; rel="next"`, paginationLink(r, nextCursor)))
+	}
+	if _, ok := r.URL.Query()["cursor"]; ok {
+		links = append(links, fmt.Sprintf(`<%s>; rel="prev"`, paginationLink(r, "")))
+	}
+	if len(links) > 0 {
+		w.Header().Set("Link", strings.Join(links, ", "))
+	}
+}
+
+// paginationLink rebuilds the current request URL with cursor set to the
+// given value (or removed, for the prev link), preserving every other query
+// parameter so a client can follow the link without re-deriving its filters.
+func paginationLink(r *http.Request, cursor string) string {
+	q := r.URL.Query()
+	if cursor == "" {
+		q.Del("cursor")
+	} else {
+		q.Set("cursor", cursor)
+	}
+
+	scheme := "http"
+	if r.URL.Scheme != "" {
+		scheme = r.URL.Scheme
+	} else if r.TLS != nil {
+		scheme = "https"
+	}
+
+	host := r.Host
+	if host == "" {
+		host = r.URL.Host
+	}
+
+	u := &url.URL{Scheme: scheme, Host: host, Path: r.URL.Path, RawQuery: q.Encode()}
+	if r.URL.RawPath != "" {
+		u.RawPath = r.URL.RawPath
+	}
+	return u.String()
+}
+
 func writeCacheHeaders(w http.ResponseWriter, kind cacheability, maxAge time.Duration, etag string) {
 	writeVary(w)
 	if etag != "" {
@@ -2287,6 +2532,14 @@ func ptr[T any](v T) *T { return &v }
 // the GraphQL resolvers in internal/api/graphql can reuse them — there is
 // exactly one source of truth for which topic positions are valid, what
 // counts as an "invalid order", etc.
+// FilterFromQuery exports filterFromQuery for cross-transport parity
+// tests: internal/api/graphql asserts that REST and GraphQL produce an
+// identical store.EventFilter for equivalent inputs, which requires a
+// handle on this package's own query-parsing entry point.
+func FilterFromQuery(r *http.Request) (store.EventFilter, error) {
+	return filterFromQuery(r)
+}
+
 func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 
 	q := r.URL.Query()
@@ -2376,6 +2629,7 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		// historical single-ID behaviour, while a comma-separated list is
 		// carried by ContractIDs below.
 		ContractID:       singleID,
+		ContractIDs:      contractIDs,
 		ContractIDPrefix: q.Get("contract_id_prefix"),
 		Types:            types,
 		Topic:            topic,
@@ -2392,6 +2646,41 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		Order:            q.Get("order"),
 		OrderBy:          q.Get("order_by"),
 		Cursor:           q.Get("cursor"),
+	}
+
+	if rawTx := q.Get("tx_index"); rawTx != "" {
+		txIdx, terr := strconv.Atoi(rawTx)
+		if terr != nil || txIdx < 0 {
+			return store.EventFilter{}, fmt.Errorf("invalid tx_index %q (want a non-negative integer)", rawTx)
+		}
+		args.TxIndex = ptr(int32(txIdx))
+	}
+	if rawOp := q.Get("op_index"); rawOp != "" {
+		opIdx, oerr := strconv.Atoi(rawOp)
+		if oerr != nil || opIdx < 0 {
+			return store.EventFilter{}, fmt.Errorf("invalid op_index %q (want a non-negative integer)", rawOp)
+		}
+		args.OpIndex = ptr(int32(opIdx))
+	}
+	switch raw := q.Get("in_successful_call"); raw {
+	case "":
+		// nil — no constraint
+	case "true":
+		args.InSuccessfulCall = ptr(true)
+	case "false":
+		args.InSuccessfulCall = ptr(false)
+	default:
+		return store.EventFilter{}, fmt.Errorf("invalid in_successful_call %q (want true or false)", raw)
+	}
+	switch raw := q.Get("has_value"); raw {
+	case "":
+		// nil — no constraint
+	case "true":
+		args.HasValue = ptr(true)
+	case "false":
+		args.HasValue = ptr(false)
+	default:
+		return store.EventFilter{}, fmt.Errorf("has_value must be true or false, got %q", raw)
 	}
 
 	// ?limit=N: explicit validation here so an explicit `?limit=0` (or
@@ -2412,10 +2701,6 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		return f, err
 
 	}
-	// ContractIDs is set outside EventFilterArgs because the shared queries
-	// package (used by GraphQL) has no multi-ID concept yet; the store
-	// turns a non-empty list into `contract_id = ANY($N)`.
-	f.ContractIDs = contractIDs
 
 	// Scope is attached here, the single place REST list filters are built:
 	// queries.BuildEventFilter is shared with the GraphQL resolvers and
@@ -2433,32 +2718,6 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 
 	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
 		return f, fmt.Errorf("invalid cursor %q", f.Cursor)
-	}
-
-	if rawTx := q.Get("tx_index"); rawTx != "" {
-		txIdx, err := strconv.Atoi(rawTx)
-		if err != nil || txIdx < 0 {
-			return f, fmt.Errorf("invalid tx_index %q (want a non-negative integer)", rawTx)
-		}
-		f.TxIndex = ptr(int32(txIdx))
-	}
-	if rawOp := q.Get("op_index"); rawOp != "" {
-		opIdx, err := strconv.Atoi(rawOp)
-		if err != nil || opIdx < 0 {
-			return f, fmt.Errorf("invalid op_index %q (want a non-negative integer)", rawOp)
-		}
-		f.OpIndex = ptr(int32(opIdx))
-	}
-
-	switch raw := q.Get("in_successful_call"); raw {
-	case "":
-		// nil — no constraint
-	case "true":
-		f.InSuccessfulCall = ptr(true)
-	case "false":
-		f.InSuccessfulCall = ptr(false)
-	default:
-		return f, fmt.Errorf("invalid in_successful_call %q (want true or false)", raw)
 	}
 
 	// order/order_by/topic/topic0..topic3/topic_contains/from_ledger/
@@ -2503,19 +2762,6 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		}
 		f.Order = "desc"
 		f.Limit = n
-	}
-
-	if raw := q.Get("has_value"); raw != "" {
-		switch raw {
-		case "true":
-			t := true
-			f.HasValue = &t
-		case "false":
-			v := false
-			f.HasValue = &v
-		default:
-			return f, fmt.Errorf("has_value must be true or false, got %q", raw)
-		}
 	}
 
 	return f, nil
@@ -2575,7 +2821,7 @@ func (s *Server) syncStreamScope(ctx context.Context, sub *broadcast.Subscriptio
 					// database error: it was correct as of the last
 					// successful resolve, and widening or narrowing on a
 					// failed read would be guessing.
-					s.log.Warn("refreshing stream scope", "tenant", p.Tenant.ID, "error", err)
+					loggerFromContext(ctx).Warn("refreshing stream scope", "tenant", p.Tenant.ID, "error", err)
 					continue
 				}
 				if !tenant.Enabled {
@@ -2584,7 +2830,7 @@ func (s *Server) syncStreamScope(ctx context.Context, sub *broadcast.Subscriptio
 				}
 				scope, err := s.tenants.ScopeForTenant(ctx, tenant)
 				if err != nil {
-					s.log.Warn("refreshing stream scope", "tenant", p.Tenant.ID, "error", err)
+					loggerFromContext(ctx).Warn("refreshing stream scope", "tenant", p.Tenant.ID, "error", err)
 					continue
 				}
 				sub.SetScope(scope)
@@ -2597,7 +2843,7 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 
 	if s.bcast == nil {
 
-		http.Error(w, "streaming not configured", http.StatusNotImplemented)
+		writeError(w, http.StatusNotImplemented, errors.New("streaming not configured"))
 
 		return
 
