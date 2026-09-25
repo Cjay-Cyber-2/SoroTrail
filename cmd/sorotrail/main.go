@@ -32,6 +32,7 @@ import (
 	"github.com/sorotrail/sorotrail/internal/decode"
 	"github.com/sorotrail/sorotrail/internal/ingester"
 	"github.com/sorotrail/sorotrail/internal/pruner"
+	"github.com/sorotrail/sorotrail/internal/requestid"
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/spec"
 	"github.com/sorotrail/sorotrail/internal/store"
@@ -540,7 +541,8 @@ func run() error {
 	if ingesterEnabled {
 		remaining++ // + ingester
 		go func() {
-			log.Info("ingester starting", "rpc_urls", rpcURLsForLog(cfg), "poll_interval", cfg.PollInterval)
+			log.Info("ingester starting", requestid.Field, requestid.JobIngester,
+				"rpc_urls", rpcURLsForLog(cfg), "poll_interval", cfg.PollInterval)
 			if err := ing.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				errCh <- fmt.Errorf("ingester: %w", err)
 			} else {
@@ -562,7 +564,7 @@ func run() error {
 	if aud != nil {
 		remaining++ // + auditor
 		go func() {
-			log.Info("auditor starting",
+			log.Info("auditor starting", requestid.Field, requestid.JobAuditor,
 				"budget_share", cfg.AuditBudgetShare,
 				"batch_ledgers", cfg.AuditBatchLedgers,
 				"lag_threshold", cfg.AuditLagThreshold,
@@ -590,7 +592,7 @@ func run() error {
 	remaining++ // + pruner
 	go func() {
 		if cfg.RetentionEnabled() {
-			log.Info("pruner starting",
+			log.Info("pruner starting", requestid.Field, requestid.JobPruner,
 				"max_age", cfg.RetentionMaxAge,
 				"min_ledger", cfg.RetentionMinLedger,
 				"batch_size", cfg.RetentionBatchSize,
