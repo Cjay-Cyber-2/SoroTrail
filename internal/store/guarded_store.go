@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/sorotrail/sorotrail/internal/metrics"
 	"github.com/sorotrail/sorotrail/internal/requestid"
 )
 
@@ -45,11 +46,19 @@ func (s *guardedStore) wrapContext(ctx context.Context, name string) (context.Co
 	return context.WithTimeout(ctx, s.options.Timeout)
 }
 
+// logSlowQuery records every wrapped operation's duration and outcome, and
+// additionally logs the ones that cross the slow-query threshold. Because it
+// is the single helper every method calls, instrumenting it here gives every
+// Store operation a metric without duplicating recording at each call site.
 func (s *guardedStore) logSlowQuery(ctx context.Context, name string, start time.Time, err error) {
+	outcome := "success"
 	if err != nil {
+		outcome = "error"
 		s.queryErrors.Add(1)
 	}
 	duration := time.Since(start)
+	metrics.DBOperationsTotal.WithLabelValues(name, outcome).Inc()
+	metrics.DBQueryDuration.WithLabelValues(name).Observe(duration.Seconds())
 	if duration < s.options.SlowQueryThreshold {
 		return
 	}
@@ -518,4 +527,166 @@ func (s *guardedStore) GetAddressSummary(ctx context.Context, address string) (A
 	summary, err := s.Store.GetAddressSummary(ctx, address)
 	s.logSlowQuery(ctx, "store.GetAddressSummary", start, err)
 	return summary, err
+}
+
+func (s *guardedStore) DeadLetterEvent(ctx context.Context, in DeadLetterInput) (DeadLetter, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.DeadLetterEvent")
+	defer cancel()
+	start := time.Now()
+	d, err := s.Store.DeadLetterEvent(ctx, in)
+	s.logSlowQuery(ctx, "store.DeadLetterEvent", start, err)
+	return d, err
+}
+
+func (s *guardedStore) ListDeadLetters(ctx context.Context, contractID string, limit int, cursor string) ([]DeadLetter, string, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.ListDeadLetters")
+	defer cancel()
+	start := time.Now()
+	letters, next, err := s.Store.ListDeadLetters(ctx, contractID, limit, cursor)
+	s.logSlowQuery(ctx, "store.ListDeadLetters", start, err)
+	return letters, next, err
+}
+
+func (s *guardedStore) GetDeadLetter(ctx context.Context, id int64) (DeadLetter, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.GetDeadLetter")
+	defer cancel()
+	start := time.Now()
+	d, err := s.Store.GetDeadLetter(ctx, id)
+	s.logSlowQuery(ctx, "store.GetDeadLetter", start, err)
+	return d, err
+}
+
+func (s *guardedStore) DeleteDeadLetter(ctx context.Context, id int64) error {
+	ctx, cancel := s.wrapContext(ctx, "store.DeleteDeadLetter")
+	defer cancel()
+	start := time.Now()
+	err := s.Store.DeleteDeadLetter(ctx, id)
+	s.logSlowQuery(ctx, "store.DeleteDeadLetter", start, err)
+	return err
+}
+
+func (s *guardedStore) GetContractCursor(ctx context.Context, contractID string) (ContractCursor, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.GetContractCursor")
+	defer cancel()
+	start := time.Now()
+	c, err := s.Store.GetContractCursor(ctx, contractID)
+	s.logSlowQuery(ctx, "store.GetContractCursor", start, err)
+	return c, err
+}
+
+func (s *guardedStore) SaveContractCursor(ctx context.Context, c ContractCursor) error {
+	ctx, cancel := s.wrapContext(ctx, "store.SaveContractCursor")
+	defer cancel()
+	start := time.Now()
+	err := s.Store.SaveContractCursor(ctx, c)
+	s.logSlowQuery(ctx, "store.SaveContractCursor", start, err)
+	return err
+}
+
+func (s *guardedStore) DeleteContractCursor(ctx context.Context, contractID string) error {
+	ctx, cancel := s.wrapContext(ctx, "store.DeleteContractCursor")
+	defer cancel()
+	start := time.Now()
+	err := s.Store.DeleteContractCursor(ctx, contractID)
+	s.logSlowQuery(ctx, "store.DeleteContractCursor", start, err)
+	return err
+}
+
+func (s *guardedStore) ListContractCursors(ctx context.Context) ([]ContractCursor, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.ListContractCursors")
+	defer cancel()
+	start := time.Now()
+	cursors, err := s.Store.ListContractCursors(ctx)
+	s.logSlowQuery(ctx, "store.ListContractCursors", start, err)
+	return cursors, err
+}
+
+func (s *guardedStore) CreateAPIKey(ctx context.Context, k APIKey) (APIKey, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.CreateAPIKey")
+	defer cancel()
+	start := time.Now()
+	key, err := s.Store.CreateAPIKey(ctx, k)
+	s.logSlowQuery(ctx, "store.CreateAPIKey", start, err)
+	return key, err
+}
+
+func (s *guardedStore) GetAPIKey(ctx context.Context, id int64) (APIKey, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.GetAPIKey")
+	defer cancel()
+	start := time.Now()
+	key, err := s.Store.GetAPIKey(ctx, id)
+	s.logSlowQuery(ctx, "store.GetAPIKey", start, err)
+	return key, err
+}
+
+func (s *guardedStore) LookupAPIKeyByPrefix(ctx context.Context, prefix string) (APIKey, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.LookupAPIKeyByPrefix")
+	defer cancel()
+	start := time.Now()
+	key, err := s.Store.LookupAPIKeyByPrefix(ctx, prefix)
+	s.logSlowQuery(ctx, "store.LookupAPIKeyByPrefix", start, err)
+	return key, err
+}
+
+func (s *guardedStore) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.ListAPIKeys")
+	defer cancel()
+	start := time.Now()
+	keys, err := s.Store.ListAPIKeys(ctx)
+	s.logSlowQuery(ctx, "store.ListAPIKeys", start, err)
+	return keys, err
+}
+
+func (s *guardedStore) RevokeAPIKey(ctx context.Context, id int64) error {
+	ctx, cancel := s.wrapContext(ctx, "store.RevokeAPIKey")
+	defer cancel()
+	start := time.Now()
+	err := s.Store.RevokeAPIKey(ctx, id)
+	s.logSlowQuery(ctx, "store.RevokeAPIKey", start, err)
+	return err
+}
+
+func (s *guardedStore) ListContractIDs(ctx context.Context) ([]string, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.ListContractIDs")
+	defer cancel()
+	start := time.Now()
+	ids, err := s.Store.ListContractIDs(ctx)
+	s.logSlowQuery(ctx, "store.ListContractIDs", start, err)
+	return ids, err
+}
+
+func (s *guardedStore) GetContractMeta(ctx context.Context, contractID string) (ContractMeta, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.GetContractMeta")
+	defer cancel()
+	start := time.Now()
+	meta, err := s.Store.GetContractMeta(ctx, contractID)
+	s.logSlowQuery(ctx, "store.GetContractMeta", start, err)
+	return meta, err
+}
+
+func (s *guardedStore) UpsertContractMeta(ctx context.Context, m ContractMeta) error {
+	ctx, cancel := s.wrapContext(ctx, "store.UpsertContractMeta")
+	defer cancel()
+	start := time.Now()
+	err := s.Store.UpsertContractMeta(ctx, m)
+	s.logSlowQuery(ctx, "store.UpsertContractMeta", start, err)
+	return err
+}
+
+func (s *guardedStore) CountContractEvents(ctx context.Context, contractID string) (int64, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.CountContractEvents")
+	defer cancel()
+	start := time.Now()
+	n, err := s.Store.CountContractEvents(ctx, contractID)
+	s.logSlowQuery(ctx, "store.CountContractEvents", start, err)
+	return n, err
+}
+
+func (s *guardedStore) ListContractsNeedingRefresh(ctx context.Context, olderThan time.Time) ([]string, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.ListContractsNeedingRefresh")
+	defer cancel()
+	start := time.Now()
+	ids, err := s.Store.ListContractsNeedingRefresh(ctx, olderThan)
+	s.logSlowQuery(ctx, "store.ListContractsNeedingRefresh", start, err)
+	return ids, err
 }
