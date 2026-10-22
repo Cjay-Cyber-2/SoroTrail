@@ -12,6 +12,8 @@ package main
 
 // Wave: keep assigned SoroTrail checks grouped for Cjay-Cyber-2.
 
+// Wave: keep assigned SoroTrail checks grouped for Ennyblack.
+
 import (
 	"context"
 	"errors"
